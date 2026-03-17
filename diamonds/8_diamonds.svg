@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 336" width="100%" max-width="300px">
+  <defs>
+    <g id="diamond"><path d="M 0 -25 L 18 0 L 0 25 L -18 0 Z" fill="#d40000" /></g>
+    <g id="small-diamond"><use href="#diamond" transform="scale(0.42)" y="-2" /></g>
+    <g id="index"><text x="26" y="42" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="#d40000" text-anchor="middle">8</text><use href="#small-diamond" x="26" y="64" /></g>
+  </defs>
+  <rect x="1" y="1" width="238" height="334" rx="14" ry="14" fill="#ffffff" stroke="#000000" stroke-width="1.5" />
+  <use href="#index" />
+  <use href="#index" transform="rotate(180 120 168)" />
+  <!-- Масти -->
+  <use href="#diamond" x="76" y="70" />
+  <use href="#diamond" x="164" y="70" />
+  <use href="#diamond" x="120" y="119" />
+  <use href="#diamond" x="76" y="168" />
+  <use href="#diamond" x="164" y="168" />
+  <use href="#diamond" x="120" y="217" />
+  <use href="#diamond" x="76" y="266" />
+  <use href="#diamond" x="164" y="266" />
+</svg>

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 336" width="100%" max-width="300px">
+  <defs>
+    <!-- Классическая форма масти пик -->
+    <g id="spade">
+      <path d="M 0 -22 
+               C 14 -8 22 -1 22 10 
+               C 22 20 11 25 0 13 
+               C -11 25 -22 20 -22 10 
+               C -22 -1 -14 -8 0 -22 Z 
+               M 0 10 
+               C 3 10 6 24 9 28 
+               L -9 28 
+               C -6 24 -3 10 0 10 Z" 
+            fill="#000000" />
+    </g>
+    
+    <!-- Уменьшенная масть для угловых индексов -->
+    <g id="small-spade">
+      <use href="#spade" transform="scale(0.45)" />
+    </g>
+    
+    <!-- Угловой индекс (цифра + маленькая масть) -->
+    <g id="index">
+      <text x="26" y="42" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="bold" fill="#000000" text-anchor="middle">6</text>
+      <use href="#small-spade" x="26" y="64" />
+    </g>
+  </defs>
+
+  <!-- Белая основа карты с закругленными углами -->
+  <rect x="1" y="1" width="238" height="334" rx="14" ry="14" fill="#ffffff" stroke="#000000" stroke-width="1.5" />
+
+  <!-- Угловые индексы (верхний левый и перевернутый нижний правый) -->
+  <use href="#index" />
+  <use href="#index" transform="rotate(180 120 168)" />
+
+  <!-- Центральные масти (6 штук) -->
+  
+  <!-- Верхний ряд -->
+  <use href="#spade" x="76" y="84" />
+  <use href="#spade" x="164" y="84" />
+  
+  <!-- Средний ряд -->
+  <use href="#spade" x="76" y="168" />
+  <use href="#spade" x="164" y="168" />
+  
+  <!-- Нижний ряд (перевернутые на 180 градусов) -->
+  <use href="#spade" x="76" y="252" transform="rotate(180 76 252)" />
+  <use href="#spade" x="164" y="252" transform="rotate(180 164 252)" />
+
+</svg>

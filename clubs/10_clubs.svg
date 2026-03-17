@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 336" width="100%" max-width="300px">
+  <defs>
+    <g id="club">
+      <path d="M 0 -5 C 2 -5 5 15 8 18 L -8 18 C -5 15 -2 -5 0 -5 Z" fill="#000000" />
+      <circle cx="0" cy="-13" r="9" fill="#000000" />
+      <circle cx="-11" cy="2" r="9" fill="#000000" />
+      <circle cx="11" cy="2" r="9" fill="#000000" />
+      <circle cx="0" cy="-2" r="5" fill="#000000" />
+    </g>
+    <g id="small-club"><use href="#club" transform="scale(0.42)" y="-2" /></g>
+    <g id="index"><text x="26" y="42" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="#000000" text-anchor="middle" letter-spacing="-2">10</text><use href="#small-club" x="26" y="64" /></g>
+  </defs>
+  <rect x="1" y="1" width="238" height="334" rx="14" ry="14" fill="#ffffff" stroke="#000000" stroke-width="1.5" />
+  <use href="#index" />
+  <use href="#index" transform="rotate(180 120 168)" />
+  <!-- Масти -->
+  <use href="#club" x="76" y="64" />    <use href="#club" x="164" y="64" />
+  <use href="#club" x="76" y="132" />   <use href="#club" x="164" y="132" />
+  <use href="#club" x="76" y="204" transform="rotate(180 76 204)" /> <use href="#club" x="164" y="204" transform="rotate(180 164 204)" />
+  <use href="#club" x="76" y="272" transform="rotate(180 76 272)" /> <use href="#club" x="164" y="272" transform="rotate(180 164 272)" />
+  <!-- Центр -->
+  <use href="#club" x="120" y="98" />
+  <use href="#club" x="120" y="238" transform="rotate(180 120 238)" />
+</svg>

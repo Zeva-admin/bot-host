@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 336" width="100%" max-width="300px">
+  <defs>
+    <g id="diamond"><path d="M 0 -25 L 18 0 L 0 25 L -18 0 Z" fill="#d40000" /></g>
+    <g id="small-diamond"><use href="#diamond" transform="scale(0.42)" y="-2" /></g>
+    <g id="index"><text x="26" y="42" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="#d40000" text-anchor="middle">J</text><use href="#small-diamond" x="26" y="64" /></g>
+    <g id="jack-half">
+      <!-- Одежда (сине-золотая) -->
+      <rect x="44" y="44" width="152" height="124" fill="#0055aa" />
+      <path d="M44 44 L 196 168 L 44 168 Z" fill="#ffd700" />
+      <!-- Лицо -->
+      <rect x="100" y="70" width="40" height="40" fill="#ffe0bd" stroke="#000" stroke-width="1.5" />
+      <path d="M95 70 C 95 50, 145 50, 145 70 L 140 85 L 100 85 Z" fill="#d40000" /> <!-- Красная шапка/волосы -->
+      <path d="M90 70 L 150 70 L 120 44 Z" fill="#ddd" stroke="#000" stroke-width="1.5" />
+      <!-- Оружие (Алебарда) -->
+      <rect x="64" y="44" width="8" height="124" fill="#333" stroke="#000" stroke-width="1.5" />
+      <path d="M72 80 L 88 60 L 72 44 Z" fill="#ddd" stroke="#000" stroke-width="1.5" />
+      <use href="#small-diamond" x="156" y="110" />
+    </g>
+  </defs>
+  <rect x="1" y="1" width="238" height="334" rx="14" ry="14" fill="#ffffff" stroke="#000000" stroke-width="1.5" />
+  <use href="#index" />
+  <use href="#index" transform="rotate(180 120 168)" />
+  <rect x="44" y="44" width="152" height="248" fill="none" stroke="#000000" stroke-width="2" />
+  <use href="#jack-half" />
+  <use href="#jack-half" transform="rotate(180 120 168)" />
+</svg>

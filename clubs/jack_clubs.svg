@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 336" width="100%" max-width="300px">
+  <defs>
+    <g id="club">
+      <path d="M 0 -5 C 2 -5 5 15 8 18 L -8 18 C -5 15 -2 -5 0 -5 Z" fill="#000000" />
+      <circle cx="0" cy="-13" r="9" fill="#000000" />
+      <circle cx="-11" cy="2" r="9" fill="#000000" />
+      <circle cx="11" cy="2" r="9" fill="#000000" />
+      <circle cx="0" cy="-2" r="5" fill="#000000" />
+    </g>
+    <g id="small-club"><use href="#club" transform="scale(0.42)" y="-2" /></g>
+    <g id="index"><text x="26" y="42" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="#000000" text-anchor="middle">J</text><use href="#small-club" x="26" y="64" /></g>
+    <g id="jack-half">
+      <!-- Одежда (зеленая с золотым) -->
+      <rect x="44" y="44" width="152" height="124" fill="#006633" />
+      <path d="M44 44 L 196 168 L 44 168 Z" fill="#ffd700" />
+      <!-- Лицо -->
+      <rect x="100" y="70" width="40" height="40" fill="#ffe0bd" stroke="#000" stroke-width="1.5" />
+      <path d="M95 70 C 95 50, 145 50, 145 70 L 140 85 L 100 85 Z" fill="#222" />
+      <!-- Красная шляпа -->
+      <path d="M90 70 L 150 70 L 120 44 Z" fill="#d40000" stroke="#000" stroke-width="1.5" />
+      <!-- Стрела -->
+      <rect x="64" y="44" width="8" height="124" fill="#ddd" stroke="#000" stroke-width="1.5" />
+      <path d="M68 44 L 76 60 L 68 54 L 60 60 Z" fill="#333" />
+      <use href="#small-club" x="156" y="110" />
+    </g>
+  </defs>
+  <rect x="1" y="1" width="238" height="334" rx="14" ry="14" fill="#ffffff" stroke="#000000" stroke-width="1.5" />
+  <use href="#index" />
+  <use href="#index" transform="rotate(180 120 168)" />
+  <rect x="44" y="44" width="152" height="248" fill="none" stroke="#000000" stroke-width="2" />
+  <use href="#jack-half" />
+  <use href="#jack-half" transform="rotate(180 120 168)" />
+</svg>
