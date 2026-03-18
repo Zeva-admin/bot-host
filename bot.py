@@ -116,6 +116,15 @@ async def safe_delete_message(bot: Bot, chat_id: int, message_id: int):
         pass
 
 
+async def delete_later(bot: Bot, chat_id: int, message_id: int, delay: float = 10.0):
+    await asyncio.sleep(delay)
+    await safe_delete_message(bot, chat_id, message_id)
+
+
+def human_name(user) -> str:
+    return (getattr(user, "full_name", None) or getattr(user, "username", None) or str(getattr(user, "id", ""))).strip()
+
+
 # =========================
 # Cards / Models
 # =========================
@@ -135,8 +144,6 @@ class Suit(str, Enum):
         }[self]
 
 
-# IMPORTANT: rank codes must match your SVG naming expectations.
-# For face cards, most SVG packs use A,K,Q,J. We keep internal rank codes as in deck.
 RANKS = ["6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 RANK_VALUE = {r: i for i, r in enumerate(RANKS, start=6)}
 RANK_RU = {
@@ -191,15 +198,6 @@ class Card:
         return Card(rank=rank, suit=Suit(suit_s))
 
     def svg_path(self) -> Path:
-        """
-        Fix for wrong face-card images:
-        Many SVG packs use filenames like:
-          AS.svg / KH.svg, or A_of_spades.svg, or ace_of_spades.svg, etc.
-        Since user's pack is unknown, we implement a robust resolver:
-        - Try common rank tokens: A,K,Q,J for face cards, otherwise rank as-is.
-        - Try multiple naming conventions.
-        - As final fallback, scan directory and match by rank-token and suit token.
-        """
         base = Path(".") / self.suit.value
         base.mkdir(exist_ok=True)
 
@@ -214,7 +212,7 @@ class Card:
             self.suit.value.lower(),
             self.suit.name,
             self.suit.name.lower(),
-            self.suit.symbol.replace("️", ""),  # strip variation selector
+            self.suit.symbol.replace("️", ""),
         ]
 
         candidates: List[Path] = []
@@ -230,7 +228,6 @@ class Card:
                     base / f"{rt}.svg",
                 ]
 
-        # also try verbose rank words
         verbose_rank = {
             "A": ["ace", "tuz", "туз"],
             "K": ["king", "korol", "король"],
@@ -252,7 +249,6 @@ class Card:
             if p.exists():
                 return p
 
-        # directory scan fallback
         if base.exists():
             rank_needles = [t.lower() for t in (rank_tokens + verbose_rank)]
             suit_needles = [self.suit.value.lower(), self.suit.name.lower(), self.suit.symbol.replace("️", "")]
@@ -361,6 +357,10 @@ class GameState:
 
     ai_lock: bool = False
 
+    winners_user_ids: List[int] = field(default_factory=list)
+    loser_user_id: Optional[int] = None
+    end_reason: Optional[str] = None
+
     def all_table_ranks(self) -> Set[str]:
         ranks = set()
         for p in self.table:
@@ -370,7 +370,8 @@ class GameState:
         return ranks
 
     def max_attack_cards(self, defender_hand_size: int) -> int:
-        return min(6, defender_hand_size)
+        # requirement: table limit should be 4, not 6
+        return min(4, defender_hand_size)
 
     def is_all_covered(self) -> bool:
         return len(self.table) > 0 and all(p.is_covered() for p in self.table)
@@ -555,6 +556,7 @@ class GameEngine:
         if n < 2:
             lobby.status = LobbyStatus.finished
             gs.phase = TurnPhase.finished
+            gs.end_reason = "Игра прервана: не хватает игроков."
 
     def is_player_out(self, player: Player, gs: GameState) -> bool:
         return len(player.hand) == 0 and len(gs.deck) == 0
@@ -571,10 +573,24 @@ class GameEngine:
     def _check_endgame(self, lobby: Lobby):
         gs = self.get_game(lobby.lobby_id)
         assert gs
+
+        if lobby.status == LobbyStatus.finished:
+            return
+
         out = [p for p in lobby.players if self.is_player_out(p, gs)]
+        remaining = [p for p in lobby.players if not self.is_player_out(p, gs)]
+
         if len(out) >= len(lobby.players) - 1:
             lobby.status = LobbyStatus.finished
             gs.phase = TurnPhase.finished
+            gs.winners_user_ids = [p.user_id for p in out]
+
+            if len(remaining) == 1:
+                gs.loser_user_id = remaining[0].user_id
+                gs.end_reason = "Остался последний с картами — дурак."
+            else:
+                gs.loser_user_id = None
+                gs.end_reason = "Все вышли одновременно."
 
     def _ranks_allowed_for_throw(self, gs: GameState) -> Set[str]:
         return gs.all_table_ranks() if gs.table else set()
@@ -600,7 +616,7 @@ class GameEngine:
         if card.rank not in ranks:
             return False, "Подкидывать можно только по номиналам, которые уже есть на столе."
         if len(gs.table) + len(pending) >= gs.max_attack_cards(len(defender.hand)):
-            return False, "Больше подкинуть нельзя (лимит по картам защитника)."
+            return False, "Больше подкинуть нельзя (лимит 4 карты на столе и по руке защитника)."
         return True, "ok"
 
     def toggle_attack_select(self, lobby: Lobby, attacker: Player, card: Card) -> Tuple[bool, str]:
@@ -649,7 +665,7 @@ class GameEngine:
                 if c.rank not in ranks:
                     return False, "Среди выбранных есть карта, которую нельзя подкинуть по номиналу.", []
             if len(temp_table) + len(temp_pending) >= gs.max_attack_cards(len(defender.hand)):
-                return False, "Слишком много карт (лимит по картам защитника).", []
+                return False, "Слишком много карт (лимит 4 и по руке защитника).", []
             temp_pending.append(c)
 
         applied = list(pending)
@@ -669,6 +685,8 @@ class GameEngine:
             return False, "Сейчас не твоя очередь защищаться."
         if gs.phase != TurnPhase.defend:
             return False, "Сейчас нельзя отбиваться."
+        if gs.took:
+            return False, "Ты уже нажал(а) «Взять»."
         if not gs.table:
             return False, "На столе нет карт."
         if pair_index < 0 or pair_index >= len(gs.table):
@@ -708,6 +726,8 @@ class GameEngine:
             return False, "Сейчас не твоя очередь защищаться."
         if not gs.table:
             return False, "На столе нет карт."
+        if gs.took:
+            return False, "Уже выбрано «Взять»."
         if gs.phase not in (TurnPhase.defend, TurnPhase.attack_select):
             return False, "Сейчас нельзя взять."
         gs.took = True
@@ -735,7 +755,7 @@ class GameEngine:
             return False, "Соперник не найден."
         total_pending = sum(len(v) for v in gs.pending_throwin.values())
         if len(gs.table) + total_pending >= gs.max_attack_cards(len(defender.hand)):
-            return False, "Больше подкинуть нельзя (лимит по картам защитника)."
+            return False, "Больше подкинуть нельзя (лимит 4 и по руке защитника)."
         return True, "ok"
 
     def toggle_throwin_select(self, lobby: Lobby, player: Player, card: Card) -> Tuple[bool, str]:
@@ -852,7 +872,7 @@ class GameEngine:
 
 
 # =========================
-# Groq AI
+# Groq AI + heuristics (unchanged)
 # =========================
 class GroqDurakAI:
     def __init__(self, api_key: str):
@@ -920,10 +940,7 @@ class GroqDurakAI:
             "deck_left": len(gs.deck),
             "ai_hand": [c.to_code() for c in ai_player.hand],
             "table": [
-                {
-                    "attack": pair.attack.to_code(),
-                    "defense": pair.defense.to_code() if pair.defense else None,
-                }
+                {"attack": pair.attack.to_code(), "defense": pair.defense.to_code() if pair.defense else None}
                 for pair in gs.table
             ],
             "discard": [c.to_code() for c in gs.discard],
@@ -931,9 +948,7 @@ class GroqDurakAI:
             "unseen_cards": unseen_codes,
             "unseen_by_suit": unseen_by_suit,
             "unseen_by_rank": unseen_by_rank,
-            "opponent_hand_sizes": {
-                str(p.seat): len(p.hand) for p in lobby.players if not p.is_ai
-            },
+            "opponent_hand_sizes": {str(p.seat): len(p.hand) for p in lobby.players if not p.is_ai},
         }
 
     def _write_ai_state_file(self, lobby: Lobby, gs: GameState, ai_player: Player) -> Dict:
@@ -946,10 +961,6 @@ class GroqDurakAI:
         return snapshot
 
     async def choose_action(self, lobby: Lobby, gs: GameState, ai_player: Player) -> Dict:
-        # Real difficulty: easy model is tiny and often can't follow, so:
-        # - easy: 25% model, 75% heuristic (very beatable)
-        # - normal: 70% model, 30% heuristic
-        # - hard: 95% model, 5% heuristic
         diff = lobby.ai_difficulty or AIDifficulty.hard
         prob_use_model = {
             AIDifficulty.easy: 0.25,
@@ -971,8 +982,7 @@ class GroqDurakAI:
         model = lobby.ai_model or AI_MODEL_HARD
 
         system = (
-            "Ты играешь в русского «Дурака» (подкидной). "
-            "Верни ТОЛЬКО JSON без текста. "
+            "Ты играешь в русского «Дурака» (подкидной). Верни ТОЛЬКО JSON без текста. "
             "Выбирай действие строго из ALLOWED_MOVES_JSON.\n"
             "Форматы:\n"
             '{"type":"attack","cards":["rank|suit", ...]}\n'
@@ -983,10 +993,7 @@ class GroqDurakAI:
             '{"type":"wait"}\n'
         )
         if diff == AIDifficulty.hard:
-            system += (
-                "Используй CARD_COUNTING_SNAPSHOT_JSON для подсчета карт и сильной игры. "
-                "Сначала тщательно обдумай (без вывода рассуждений), затем верни один JSON.\n"
-            )
+            system += "Используй CARD_COUNTING_SNAPSHOT_JSON для сильной игры.\n"
 
         user_lines = [
             f"TRUMP: {gs.trump.value}",
@@ -1005,23 +1012,19 @@ class GroqDurakAI:
         user_lines.append(f"ALLOWED_MOVES_JSON:\n{json.dumps(allowed, ensure_ascii=False)}\n")
         user_lines.append("Выбери лучший ход и верни один JSON.")
 
-        user = {
-            "role": "user",
-            "content": "\n".join(user_lines),
-        }
+        user = {"role": "user", "content": "\n".join(user_lines)}
 
         def call_sync() -> str:
             client = self._client()
             completion = client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    user,
-                ],
+                messages=[{"role": "system", "content": system}, user],
                 temperature=0.7 if diff != AIDifficulty.easy else 1.0,
                 top_p=1,
                 max_completion_tokens=500 if diff == AIDifficulty.easy else 700,
-                reasoning_effort="low" if diff == AIDifficulty.easy else ("medium" if diff == AIDifficulty.normal else "high"),
+                reasoning_effort="low"
+                if diff == AIDifficulty.easy
+                else ("medium" if diff == AIDifficulty.normal else "high"),
                 stream=False,
                 stop=None,
             )
@@ -1045,8 +1048,7 @@ class GroqDurakAI:
     def _parse_json_action(raw: str) -> Optional[Dict]:
         raw = raw.strip()
         if raw.startswith("```"):
-            raw = raw.strip("`")
-            raw = raw.replace("json", "", 1).strip()
+            raw = raw.strip("`").replace("json", "", 1).strip()
         try:
             return json.loads(raw)
         except Exception:
@@ -1147,21 +1149,12 @@ class GroqDurakAI:
         return canon(action) in aset
 
 
-# =========================
-# AI heuristics (difficulty-based)
-# =========================
 def heuristic_ai_action(lobby: Lobby, gs: GameState, ai: Player) -> Dict:
     trump = gs.trump
     diff = lobby.ai_difficulty or AIDifficulty.hard
-
-    # difficulty tuning:
-    # easy: makes "worse" choices: often takes instead of defending, attacks with higher cards
-    # normal: moderate, prefer lower non-trumps
-    # hard (heuristic fallback): strong-ish minimal defense
     take_bias = {AIDifficulty.easy: 0.45, AIDifficulty.normal: 0.18, AIDifficulty.hard: 0.05}[diff]
 
     if ai.seat == gs.attacker_seat and gs.table and gs.is_all_covered():
-        # easy sometimes forgets bito and tries to add more if possible
         if diff == AIDifficulty.easy and random.random() < 0.35:
             pass
         else:
@@ -1183,14 +1176,12 @@ def heuristic_ai_action(lobby: Lobby, gs: GameState, ai: Player) -> Dict:
             return card.rank in ranks
 
         if diff == AIDifficulty.easy:
-            # sometimes attack with random legal card (even trump)
             legal = [c for c in ai.hand if can_add(c, [])]
             if not legal:
                 return {"type": "wait"}
             c = random.choice(legal)
             return {"type": "attack", "cards": [c.to_code()]}
 
-        # normal/hard: lowest non-trump, else lowest
         hand_sorted = sorted(ai.hand, key=lambda c: (c.suit == trump, c.rank_value))
         for c in hand_sorted:
             if can_add(c, []):
@@ -1200,13 +1191,11 @@ def heuristic_ai_action(lobby: Lobby, gs: GameState, ai: Player) -> Dict:
     if gs.phase == TurnPhase.defend and ai.seat == gs.defender_seat:
         if random.random() < take_bias:
             return {"type": "take"}
-
         uncovered = [(i, p.attack) for i, p in enumerate(gs.table) if p.defense is None]
         for idx, atk in uncovered:
             beaters = [c for c in ai.hand if CardsService.beats(c, atk, trump)]
             if beaters:
                 if diff == AIDifficulty.easy:
-                    # easy picks a random beater (often wastes trumps)
                     c = random.choice(beaters)
                 else:
                     beaters_sorted = sorted(beaters, key=lambda c: (c.suit == trump, c.rank_value))
@@ -1219,12 +1208,9 @@ def heuristic_ai_action(lobby: Lobby, gs: GameState, ai: Player) -> Dict:
         candidates = [c for c in ai.hand if c.rank in allowed]
         if not candidates:
             return {"type": "throwin_done", "cards": []}
-
         if diff == AIDifficulty.easy:
-            # easy often throws too much / random
             c = random.choice(candidates)
             return {"type": "throwin_done", "cards": [c.to_code()]}
-
         candidates_sorted = sorted(candidates, key=lambda c: (c.suit == trump, c.rank_value))
         return {"type": "throwin_done", "cards": [candidates_sorted[0].to_code()]}
 
@@ -1356,7 +1342,7 @@ async def run_ai_loop_until_human_turn(bot: Bot, lobby: Lobby, gs: GameState, ma
 
 
 # =========================
-# Telegram UI / callbacks
+# Callback data
 # =========================
 class CB:
     MENU_OPEN = "m:open"
@@ -1364,7 +1350,6 @@ class CB:
     MENU_JOIN = "m:join"
     MENU_HELP = "m:help"
     MENU_AI = "m:ai"
-
     AI_DIFF = "ai:diff:"  # + easy/normal/hard
 
     LOBBY_REFRESH = "l:refresh"
@@ -1381,7 +1366,14 @@ class CB:
     GAME_CLEAR = "g:clear"
     GAME_DEFEND = "g:def:"
 
+    CONFIRM_LEAVE = "c:leave"
+    CONFIRM_LEAVE_YES = "c:leave:yes"
+    CONFIRM_LEAVE_NO = "c:leave:no"
 
+
+# =========================
+# Keyboards
+# =========================
 def kb_ai_difficulty() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1401,6 +1393,17 @@ def kb_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Войти по коду", callback_data=CB.MENU_JOIN)],
             [InlineKeyboardButton(text="Игра против ИИ", callback_data=CB.MENU_AI)],
             [InlineKeyboardButton(text="Правила", callback_data=CB.MENU_HELP)],
+        ]
+    )
+
+
+def kb_confirm_leave(in_game: bool) -> InlineKeyboardMarkup:
+    back_cb = CB.GAME_REFRESH if in_game else CB.LOBBY_REFRESH
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выйти", callback_data=CB.CONFIRM_LEAVE_YES)],
+            [InlineKeyboardButton(text="❌ Нет", callback_data=CB.CONFIRM_LEAVE_NO)],
+            [InlineKeyboardButton(text="Назад", callback_data=back_cb)],
         ]
     )
 
@@ -1427,7 +1430,7 @@ def kb_lobby(lobby: Lobby, me_id: int) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(text="Обновить", callback_data=CB.LOBBY_REFRESH),
-            InlineKeyboardButton(text="Выйти", callback_data=CB.LOBBY_LEAVE),
+            InlineKeyboardButton(text="Выйти", callback_data=CB.CONFIRM_LEAVE),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1440,12 +1443,12 @@ def kb_game(lobby: Lobby, gs: GameState, me: Player) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(text="Обновить", callback_data=CB.GAME_REFRESH),
-                InlineKeyboardButton(text="Выйти", callback_data=CB.GAME_LEAVE),
+                InlineKeyboardButton(text="Выйти", callback_data=CB.CONFIRM_LEAVE),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    if me.seat == gs.defender_seat and gs.phase == TurnPhase.defend:
+    if me.seat == gs.defender_seat and gs.phase == TurnPhase.defend and not gs.took:
         uncovered = [i for i, p in enumerate(gs.table) if p.defense is None]
         target_idx = uncovered[0] if uncovered else 0
         btns = []
@@ -1491,19 +1494,56 @@ def kb_game(lobby: Lobby, gs: GameState, me: Player) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(text="Обновить", callback_data=CB.GAME_REFRESH),
-            InlineKeyboardButton(text="Выйти", callback_data=CB.GAME_LEAVE),
+            InlineKeyboardButton(text="Выйти", callback_data=CB.CONFIRM_LEAVE),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =========================
-# Rendering
+# Rules text
+# =========================
+def rules_text() -> str:
+    return (
+        "<b>Правила игры «Дурак» (подкидной, 36 карт)</b>\n\n"
+        "<b>Колода:</b> 36 карт (6–Туз). Козырь определяется по нижней карте колоды.\n"
+        "<b>Игроки:</b> 2–4.\n"
+        "<b>Раздача:</b> по 6 карт каждому.\n\n"
+        "<b>Роли:</b>\n"
+        "• <b>Атакующий</b> кладёт карту(ы) на стол.\n"
+        "• <b>Защитник</b> обязан побить каждую атакующую карту или взять все карты со стола.\n\n"
+        "<b>Как бить:</b>\n"
+        "• Картой той же масти более высокого номинала.\n"
+        "• Или любым козырем, если атакующая карта не козырная.\n\n"
+        "<b>Подкидывание:</b>\n"
+        "• После первой карты атакующий может подкидывать карты только тех номиналов, которые уже есть на столе.\n"
+        "• Максимум карт на столе за один ход — <b>4</b> (и не больше количества карт у защитника).\n\n"
+        "<b>Взять:</b>\n"
+        "• Защитник может нажать «Взять» и забрать все карты со стола.\n"
+        "• После «Взять» другие игроки (кроме защитника) могут подкинуть карты по номиналам со стола.\n\n"
+        "<b>Бито:</b>\n"
+        "• Когда все карты побиты, <b>атакующий</b> нажимает «Бито» — карты уходят в сброс.\n\n"
+        "<b>Добор:</b>\n"
+        "• После завершения хода игроки добирают карты из колоды до 6 (сначала атакующий, далее по кругу).\n\n"
+        "<b>Конец игры:</b>\n"
+        "• Когда колода закончилась, игроки, у которых нет карт, считаются вышедшими.\n"
+        "• Последний игрок, у которого остались карты, — <b>дурак</b>.\n\n"
+        "<b>Правила использования бота:</b>\n"
+        "• Карты выбираются кнопками.\n"
+        "• Для общения используйте: <code>/say текст</code> (сообщение будет удалено автоматически).\n"
+        "• Кнопка «Выйти» требует подтверждения.\n"
+    )
+
+
+# =========================
+# Rendering helpers
 # =========================
 def render_lobby_text(lobby: Lobby) -> str:
     lines = []
     lines.append(f"<b>Лобби</b> <code>{lobby.lobby_id}</code>")
-    mode_ru = "открытое" if lobby.mode == LobbyMode.open else ("закрытое" if lobby.mode == LobbyMode.closed else "против ИИ")
+    mode_ru = (
+        "открытое" if lobby.mode == LobbyMode.open else ("закрытое" if lobby.mode == LobbyMode.closed else "против ИИ")
+    )
     lines.append(f"Режим: <b>{mode_ru}</b>")
     if lobby.mode == LobbyMode.ai and lobby.ai_difficulty:
         diff_ru = {"easy": "лёгкий", "normal": "нормальный", "hard": "тяжёлый"}[lobby.ai_difficulty.value]
@@ -1521,6 +1561,21 @@ def render_lobby_text(lobby: Lobby) -> str:
     lines.append("")
     lines.append("Выбери цвет и нажми «Начать игру».")
     return "\n".join(lines)
+
+
+def _result_block_for_player(lobby: Lobby, gs: GameState, me: Player) -> str:
+    if lobby.status != LobbyStatus.finished and gs.phase != TurnPhase.finished:
+        return ""
+    reason = gs.end_reason or "Игра завершена."
+    if gs.loser_user_id is None and gs.winners_user_ids:
+        if me.user_id in gs.winners_user_ids:
+            return f"\n\n<b>🏁 Игра окончена.</b>\n<b>Ничья / одновременный выход.</b>\n{reason}"
+        return f"\n\n<b>🏁 Игра окончена.</b>\n{reason}"
+    if gs.loser_user_id == me.user_id:
+        return f"\n\n<b>🏁 Игра окончена.</b>\n<b>❌ Вы проиграли (вы — дурак).</b>\n{reason}"
+    if me.user_id in gs.winners_user_ids:
+        return f"\n\n<b>🏁 Игра окончена.</b>\n<b>✅ Победа!</b>\n{reason}"
+    return f"\n\n<b>🏁 Игра окончена.</b>\n{reason}"
 
 
 def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine) -> str:
@@ -1544,25 +1599,39 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
     lines.append(f"Защищается: <b>{seat_name(gs.defender_seat)}</b>")
 
     if lobby.status == LobbyStatus.playing:
+        if gs.took:
+            if me.seat == gs.defender_seat:
+                lines.append("")
+                lines.append("<b>⚠️ Ты берёшь карты!</b>")
+                lines.append("Жди, пока соперники подкинут и нажмут «Подкинуть выбранные» (или ничего не подкинут).")
+            else:
+                lines.append("")
+                lines.append("<b>⚠️ Защитник берёт карты!</b>")
+                lines.append("Подкинь по номиналам со стола и нажми «Подкинуть выбранные» (или не подкидывай).")
+
         if gs.phase == TurnPhase.attack_select:
             if me.seat == gs.attacker_seat:
                 sel = gs.pending_attack.get(me.seat, [])
+                lines.append("")
                 lines.append(f"Твой ход: выбери карты и нажми <b>«Кинуть выбранные»</b>. Выбрано: <b>{len(sel)}</b>")
             else:
+                lines.append("")
                 lines.append("Ожидаем ход атакующего…")
         elif gs.phase == TurnPhase.defend:
             if me.seat == gs.defender_seat:
+                lines.append("")
                 lines.append("Твоя защита: нажимай карты, чтобы <b>побить</b>, или нажми <b>«Взять»</b>.")
             else:
+                lines.append("")
                 lines.append("Ожидаем защиту…")
         elif gs.phase == TurnPhase.throwin_select:
             if me.seat == gs.defender_seat:
+                lines.append("")
                 lines.append("Ты берёшь карты. Остальные могут подкинуть по номиналам со стола.")
             else:
                 sel = gs.pending_throwin.get(me.seat, [])
-                lines.append(
-                    f"Подкидывание: выбери карты и нажми <b>«Подкинуть выбранные»</b>. Выбрано: <b>{len(sel)}</b>"
-                )
+                lines.append("")
+                lines.append(f"Подкидывание: выбери карты и нажми <b>«Подкинуть выбранные»</b>. Выбрано: <b>{len(sel)}</b>")
 
     lines.append("")
     lines.append("<b>Карты у игроков:</b>")
@@ -1583,6 +1652,7 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
             else:
                 lines.append(f"{i}. {pair.attack.compact} → …")
 
+    lines.append(_result_block_for_player(lobby, gs, me))
     return "\n".join(lines)
 
 
@@ -1594,6 +1664,9 @@ engine = GameEngine()
 awaiting_code: Set[int] = set()
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY)
+
+# chat anti-spam
+last_say_ts: Dict[int, float] = {}
 
 
 # =========================
@@ -1608,7 +1681,6 @@ async def broadcast_table_card_photos(bot: Bot, lobby: Lobby, gs: GameState, car
         for c in cards:
             svg = c.svg_path()
             if not svg.exists():
-                # if svg missing, still don't crash; skip
                 continue
             try:
                 png = svg_to_png_bytes(svg)
@@ -1643,6 +1715,7 @@ async def update_lobby_ui(bot: Bot, lobby: Lobby):
 
 async def update_game_ui(bot: Bot, lobby: Lobby, gs: GameState):
     engine.normalize_turn_seats_after_leave(lobby, gs)
+    engine._check_endgame(lobby)
     for p in lobby.players:
         if p.is_ai:
             continue
@@ -1658,12 +1731,62 @@ async def update_game_ui(bot: Bot, lobby: Lobby, gs: GameState):
 
 
 # =========================
-# Handlers
+# Chat (/say) with deletion
+# =========================
+async def broadcast_say(bot: Bot, lobby: Lobby, from_player: Player, text: str):
+    prefix = f"💬 <b>{from_player.name}</b>: "
+    msg_text = prefix + (text.strip()[:2000])
+
+    for p in lobby.players:
+        if p.is_ai:
+            continue
+        try:
+            m = await bot.send_message(p.user_id, msg_text, parse_mode=ParseMode.HTML)
+            asyncio.create_task(delete_later(bot, p.user_id, m.message_id, 10.0))
+        except Exception:
+            pass
+
+
+@router.message(Command("say"))
+async def cmd_say(message: Message, bot: Bot):
+    uid = message.from_user.id
+    lobby = lobbies.get_lobby_by_player(uid)
+    if not lobby:
+        # delete command anyway if possible
+        await safe_delete_message(bot, message.chat.id, message.message_id)
+        return
+
+    ts = now_ts()
+    if ts - last_say_ts.get(uid, 0) < 2.0:
+        await safe_delete_message(bot, message.chat.id, message.message_id)
+        warn = await message.answer("Слишком часто. Подожди немного.")
+        asyncio.create_task(delete_later(bot, warn.chat.id, warn.message_id, 3.0))
+        return
+    last_say_ts[uid] = ts
+
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    await safe_delete_message(bot, message.chat.id, message.message_id)
+
+    if len(parts) < 2 or not parts[1].strip():
+        warn = await message.answer("Использование: /say текст")
+        asyncio.create_task(delete_later(bot, warn.chat.id, warn.message_id, 3.0))
+        return
+
+    from_player = next((p for p in lobby.players if p.user_id == uid), None)
+    if not from_player:
+        return
+
+    await broadcast_say(bot, lobby, from_player, parts[1])
+
+
+# =========================
+# Handlers: Menu
 # =========================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     awaiting_code.discard(message.from_user.id)
-    await message.answer("Меню игры «Дурак» (подкидной, 36 карт).", reply_markup=kb_menu())
+    await message.answer("Меню игры «Дурак».\n\nЧат: /say текст", reply_markup=kb_menu())
 
 
 @router.message(Command("menu"))
@@ -1675,15 +1798,7 @@ async def cmd_menu(message: Message):
 @router.callback_query(F.data == CB.MENU_HELP)
 async def cb_help(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text(
-        "ИИ уровни:\n"
-        "• Лёгкий — слабая модель + ошибки.\n"
-        "• Нормальный — сильная модель, иногда упрощает.\n"
-        "• Тяжёлый — максимальная модель.\n\n"
-        "Если у карт (Валет/Дама/Король/Туз) отображаются неверные SVG — проверь названия файлов, "
-        "но бот теперь пытается находить их по нескольким шаблонам.\n",
-        reply_markup=kb_menu(),
-    )
+    await call.message.edit_text(rules_text(), parse_mode=ParseMode.HTML, reply_markup=kb_menu())
 
 
 @router.callback_query(F.data == CB.MENU_AI)
@@ -1711,7 +1826,7 @@ async def cb_ai_diff(call: CallbackQuery, bot: Bot):
         AIDifficulty.hard: AI_MODEL_HARD,
     }[diff]
 
-    human = Player(user_id=user.id, name=user.full_name)
+    human = Player(user_id=user.id, name=human_name(user))
     lobby = lobbies.create_lobby(human, LobbyMode.ai)
     lobby.ai_difficulty = diff
     lobby.ai_model = model
@@ -1745,7 +1860,7 @@ async def cb_open(call: CallbackQuery, bot: Bot):
         me.ui_message_id = call.message.message_id
         return
 
-    player = Player(user_id=user.id, name=user.full_name)
+    player = Player(user_id=user.id, name=human_name(user))
     lobby = lobbies.join_open(player)
 
     await call.message.edit_text(render_lobby_text(lobby), reply_markup=kb_lobby(lobby, user.id))
@@ -1767,7 +1882,7 @@ async def cb_closed_create(call: CallbackQuery, bot: Bot):
         me.ui_message_id = call.message.message_id
         return
 
-    owner = Player(user_id=user.id, name=user.full_name)
+    owner = Player(user_id=user.id, name=human_name(user))
     lobby = lobbies.create_lobby(owner, LobbyMode.closed)
 
     await call.message.edit_text(render_lobby_text(lobby), reply_markup=kb_lobby(lobby, user.id))
@@ -1793,7 +1908,7 @@ async def cb_join(call: CallbackQuery):
 async def msg_text(message: Message, bot: Bot):
     uid = message.from_user.id
     if uid in awaiting_code:
-        code = message.text.strip().upper()
+        code = (message.text or "").strip().upper()
         awaiting_code.discard(uid)
 
         existing = lobbies.get_lobby_by_player(uid)
@@ -1801,19 +1916,25 @@ async def msg_text(message: Message, bot: Bot):
             await message.answer("Ты уже в лобби. Выйди из него, чтобы войти в другое.", reply_markup=kb_menu())
             return
 
-        player = Player(user_id=uid, name=message.from_user.full_name)
+        player = Player(user_id=uid, name=human_name(message.from_user))
         lobby = lobbies.join_closed(player, code)
         if not lobby:
             await message.answer("Лобби по коду не найдено или оно заполнено.", reply_markup=kb_menu())
             return
 
-        sent = await message.answer(render_lobby_text(lobby), reply_markup=kb_lobby(lobby, uid), parse_mode=ParseMode.HTML)
+        sent = await message.answer(
+            render_lobby_text(lobby), reply_markup=kb_lobby(lobby, uid), parse_mode=ParseMode.HTML
+        )
         me = next(p for p in lobby.players if p.user_id == uid)
         me.ui_chat_id = sent.chat.id
         me.ui_message_id = sent.message_id
         await update_lobby_ui(bot, lobby)
+        return
 
 
+# =========================
+# Lobby handlers
+# =========================
 @router.callback_query(F.data == CB.LOBBY_REFRESH)
 async def cb_lobby_refresh(call: CallbackQuery, bot: Bot):
     await call.answer()
@@ -1842,13 +1963,71 @@ async def cb_lobby_color(call: CallbackQuery, bot: Bot):
     await update_lobby_ui(bot, lobby)
 
 
-@router.callback_query(F.data == CB.LOBBY_LEAVE)
-async def cb_lobby_leave(call: CallbackQuery, bot: Bot):
+@router.callback_query(F.data == CB.CONFIRM_LEAVE)
+async def cb_confirm_leave(call: CallbackQuery, bot: Bot):
     await call.answer()
-    lobby = lobbies.leave(call.from_user.id)
-    await call.message.edit_text("Ты вышел(ла) из лобби.", reply_markup=kb_menu())
-    if lobby:
+    lobby = lobbies.get_lobby_by_player(call.from_user.id)
+    in_game = bool(lobby and lobby.status == LobbyStatus.playing)
+    await call.message.edit_text(
+        "Вы уверены, что хотите выйти?",
+        reply_markup=kb_confirm_leave(in_game=in_game),
+    )
+
+
+@router.callback_query(F.data == CB.CONFIRM_LEAVE_NO)
+async def cb_confirm_leave_no(call: CallbackQuery, bot: Bot):
+    await call.answer()
+    lobby = lobbies.get_lobby_by_player(call.from_user.id)
+    if not lobby:
+        await call.message.edit_text("Меню:", reply_markup=kb_menu())
+        return
+    if lobby.status == LobbyStatus.playing:
+        gs = engine.get_game(lobby.lobby_id)
+        if not gs:
+            await call.message.edit_text("Меню:", reply_markup=kb_menu())
+            return
+        await update_game_ui(bot, lobby, gs)
+    else:
         await update_lobby_ui(bot, lobby)
+
+
+@router.callback_query(F.data == CB.CONFIRM_LEAVE_YES)
+async def cb_confirm_leave_yes(call: CallbackQuery, bot: Bot):
+    await call.answer()
+    lobby = lobbies.get_lobby_by_player(call.from_user.id)
+    if not lobby:
+        await call.message.edit_text("Меню:", reply_markup=kb_menu())
+        return
+
+    gs = engine.get_game(lobby.lobby_id)
+
+    # delete my table photos
+    if gs:
+        msg_ids = gs.table_photo_message_ids.get(call.from_user.id, [])
+        for mid in msg_ids:
+            await safe_delete_message(bot, call.from_user.id, mid)
+        gs.table_photo_message_ids.pop(call.from_user.id, None)
+
+    # AI lobby: remove immediately
+    if lobby.mode == LobbyMode.ai:
+        if gs:
+            await cleanup_table_photos(bot, gs)
+        lobbies.leave(call.from_user.id)
+        await call.message.edit_text("Ты вышел(ла).", reply_markup=kb_menu())
+        return
+
+    # normal lobby
+    lobbies.leave(call.from_user.id)
+
+    # update remaining
+    if gs and lobby.players:
+        engine.normalize_turn_seats_after_leave(lobby, gs)
+        engine._check_endgame(lobby)
+        await update_game_ui(bot, lobby, gs)
+    elif lobby.players and lobby.status != LobbyStatus.playing:
+        await update_lobby_ui(bot, lobby)
+
+    await call.message.edit_text("Ты вышел(ла).", reply_markup=kb_menu())
 
 
 @router.callback_query(F.data == CB.LOBBY_START)
@@ -1891,6 +2070,9 @@ async def cb_lobby_start(call: CallbackQuery, bot: Bot):
     await run_ai_loop_until_human_turn(bot, lobby, gs)
 
 
+# =========================
+# Game handlers
+# =========================
 @router.callback_query(F.data == CB.GAME_REFRESH)
 async def cb_game_refresh(call: CallbackQuery, bot: Bot):
     await call.answer()
@@ -1904,25 +2086,6 @@ async def cb_game_refresh(call: CallbackQuery, bot: Bot):
         return
     await update_game_ui(bot, lobby, gs)
     await run_ai_loop_until_human_turn(bot, lobby, gs)
-
-
-@router.callback_query(F.data == CB.GAME_LEAVE)
-async def cb_game_leave(call: CallbackQuery, bot: Bot):
-    await call.answer()
-    lobby = lobbies.get_lobby_by_player(call.from_user.id)
-    if not lobby:
-        await call.message.edit_text("Ты уже не в игре.", reply_markup=kb_menu())
-        return
-
-    gs = engine.get_game(lobby.lobby_id)
-    if gs:
-        msg_ids = gs.table_photo_message_ids.get(call.from_user.id, [])
-        for mid in msg_ids:
-            await safe_delete_message(bot, call.from_user.id, mid)
-        gs.table_photo_message_ids.pop(call.from_user.id, None)
-
-    lobbies.leave(call.from_user.id)
-    await call.message.edit_text("Ты вышел(ла).", reply_markup=kb_menu())
 
 
 @router.callback_query(F.data == CB.GAME_CLEAR)
@@ -2063,6 +2226,7 @@ async def cb_game_take(call: CallbackQuery, bot: Bot):
     if not ok:
         await call.answer(err, show_alert=True)
         return
+
     await update_game_ui(bot, lobby, gs)
     await run_ai_loop_until_human_turn(bot, lobby, gs)
 
