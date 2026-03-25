@@ -1804,7 +1804,7 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
         diff_ru = {"easy": "лёгкий", "normal": "нормальный", "hard": "тяжёлый"}[lobby.ai_difficulty.value]
         lines.append(f"Сложность: <b>{diff_ru}</b>")
     lines.append(f"Козырь: <b>{gs.trump.symbol}</b> • Козырная карта: <b>{gs.trump_card.label_ru}</b>")
-    lines.append(f"Колода: <b>{len(gs.deck)}</b> • Сброс: <b>{len(gs.discard)}</b>")
+    lines.append(f"В колоде осталось: <b>{len(gs.deck)}</b> • Сброс: <b>{len(gs.discard)}</b>")
     lines.append(f"Ходит: <b>{seat_name(gs.attacker_seat)}</b> • Защищается: <b>{seat_name(gs.defender_seat)}</b>")
     lines.append("")
     lines.append("<b>Игроки:</b>")
