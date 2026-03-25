@@ -1,14 +1,17 @@
+
 import asyncio
 import json
 import os
 import random
 import string
+import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
@@ -41,6 +44,9 @@ AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
 AI_MODEL_NORMAL = "llama-3.3-70b-versatile"
 AI_MODEL_HARD = "openai/gpt-oss-120b"
 
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "7053001262"))
+STATS_DB_PATH = Path("casino_stats.db")
+
 # =========================
 # Player colors
 # =========================
@@ -71,6 +77,168 @@ def now_ts() -> float:
 def gen_code(k: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(random.choice(alphabet) for _ in range(k))
+
+
+def init_stats_db() -> None:
+    try:
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    ts REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kv_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_events_type_ts ON user_events(event_type, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_events_user ON user_events(user_id)")
+            conn.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("admin_msg_enabled", "1"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def record_user_event(user_id: int, event_type: str) -> None:
+    if user_id <= 0:
+        return
+    try:
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO user_events (user_id, event_type, ts) VALUES (?, ?, ?)",
+                (user_id, event_type, now_ts()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def count_unique_users(event_type: str, since_ts: float) -> int:
+    try:
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            cur = conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM user_events WHERE event_type = ? AND ts >= ?",
+                (event_type, since_ts),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def get_setting(key: str, default: str) -> str:
+    try:
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            cur = conn.execute("SELECT value FROM kv_settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value: str) -> None:
+    try:
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_bool_setting(key: str, default: bool = True) -> bool:
+    val = get_setting(key, "1" if default else "0")
+    return val == "1"
+
+
+def set_bool_setting(key: str, value: bool) -> None:
+    set_setting(key, "1" if value else "0")
+
+
+def is_admin_msg_enabled() -> bool:
+    return get_bool_setting("admin_msg_enabled", True)
+
+
+def ru_day_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "дня"
+    return "дней"
+
+
+def time_greeting() -> str:
+    hour = datetime.now().hour
+    if 5 <= hour < 12:
+        return "Доброе утро"
+    if 12 <= hour < 18:
+        return "Добрый день"
+    if 18 <= hour < 23:
+        return "Добрый вечер"
+    return "Доброй ночи"
+
+
+def render_main_menu_text(user=None, compact: bool = False) -> str:
+    name = human_name(user) if user else None
+    greet = f"{time_greeting()}, <b>{name}</b>!" if name else "Выбери режим и начни игру."
+    accents = [
+        "Сегодня удача улыбается смелым.",
+        "Одна кнопка — и стол уже накрыт.",
+        "Лучшая партия начинается прямо сейчас.",
+    ]
+    accent = random.choice(accents)
+    lines = ["<b>🎴 Дурак</b> • Главное меню", ""]
+    lines.append(greet)
+    if not compact:
+        lines.append(f"<i>{accent}</i>")
+        lines.append("")
+        lines.append("<b>Режимы</b>")
+        lines.append("• Открытая игра — быстрый поиск соперников")
+        lines.append("• Закрытая игра — матч по коду")
+        lines.append("• Игра против ИИ — тренировка в одиночку")
+        lines.append("")
+        lines.append("Нужна помощь? Загляни в «Правила».")
+    return "\n".join(lines)
+
+
+def render_admin_settings_text() -> str:
+    msg_state = "включён" if is_admin_msg_enabled() else "выключен"
+    lines = [
+        "<b>🛠 Админ • Настройки</b>",
+        "",
+        f"Приём сообщений админу: <b>{msg_state}</b>",
+        "Это влияет на кнопку «Сообщение админу» в меню.",
+    ]
+    return "\n".join(lines)
+
+
+def render_admin_text() -> str:
+    now = now_ts()
+    days_list = [1, 3, 7, 30]
+    lines = ["<b>🛠 Админ • Обзор</b>", "", "Период — запускали / играли"]
+    for d in days_list:
+        since = now - d * 86400
+        launched = count_unique_users("launch", since)
+        played = count_unique_users("play", since)
+        lines.append(f"• {d} {ru_day_word(d)} — <b>{launched}</b> / <b>{played}</b>")
+    lines.append("")
+    lines.append(f"<i>Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}</i>")
+    return "\n".join(lines)
 
 
 async def safe_edit_text(
@@ -1350,6 +1518,7 @@ class CB:
     MENU_JOIN = "m:join"
     MENU_HELP = "m:help"
     MENU_AI = "m:ai"
+    MENU_ADMIN_MSG = "m:admin_msg"
     AI_DIFF = "ai:diff:"  # + easy/normal/hard
 
     LOBBY_REFRESH = "l:refresh"
@@ -1370,6 +1539,11 @@ class CB:
     CONFIRM_LEAVE_YES = "c:leave:yes"
     CONFIRM_LEAVE_NO = "c:leave:no"
 
+    ADMIN_REFRESH = "a:refresh"
+    ADMIN_MSG_CANCEL = "a:cancel"
+    ADMIN_SETTINGS = "a:settings"
+    ADMIN_TOGGLE_MSG = "a:toggle_msg"
+
 
 # =========================
 # Keyboards
@@ -1388,12 +1562,41 @@ def kb_ai_difficulty() -> InlineKeyboardMarkup:
 def kb_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Открытая игра (быстрый поиск)", callback_data=CB.MENU_OPEN)],
-            [InlineKeyboardButton(text="Закрытая игра (создать лобби)", callback_data=CB.MENU_CLOSED)],
-            [InlineKeyboardButton(text="Войти по коду", callback_data=CB.MENU_JOIN)],
-            [InlineKeyboardButton(text="Игра против ИИ", callback_data=CB.MENU_AI)],
-            [InlineKeyboardButton(text="Правила", callback_data=CB.MENU_HELP)],
+            [InlineKeyboardButton(text="🎲 Открытая игра", callback_data=CB.MENU_OPEN)],
+            [InlineKeyboardButton(text="🔒 Закрытая игра", callback_data=CB.MENU_CLOSED)],
+            [InlineKeyboardButton(text="🔑 Войти по коду", callback_data=CB.MENU_JOIN)],
+            [InlineKeyboardButton(text="🤖 Игра против ИИ", callback_data=CB.MENU_AI)],
+            [InlineKeyboardButton(text="📖 Правила", callback_data=CB.MENU_HELP)],
+            [InlineKeyboardButton(text="✉️ Сообщение админу", callback_data=CB.MENU_ADMIN_MSG)],
         ]
+    )
+
+
+def kb_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Обновить", callback_data=CB.ADMIN_REFRESH),
+                InlineKeyboardButton(text="Настройки", callback_data=CB.ADMIN_SETTINGS),
+            ],
+            [InlineKeyboardButton(text="Назад в меню", callback_data="back:menu")],
+        ]
+    )
+
+
+def kb_admin_settings() -> InlineKeyboardMarkup:
+    state = "Вкл" if is_admin_msg_enabled() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Сообщения админу: {state}", callback_data=CB.ADMIN_TOGGLE_MSG)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_REFRESH)],
+        ]
+    )
+
+
+def kb_admin_msg_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.ADMIN_MSG_CANCEL)]]
     )
 
 
@@ -1505,33 +1708,28 @@ def kb_game(lobby: Lobby, gs: GameState, me: Player) -> InlineKeyboardMarkup:
 # =========================
 def rules_text() -> str:
     return (
-        "<b>Правила игры «Дурак» (подкидной, 36 карт)</b>\n\n"
-        "<b>Колода:</b> 36 карт (6–Туз). Козырь определяется по нижней карте колоды.\n"
-        "<b>Игроки:</b> 2–4.\n"
-        "<b>Раздача:</b> по 6 карт каждому.\n\n"
-        "<b>Роли:</b>\n"
-        "• <b>Атакующий</b> кладёт карту(ы) на стол.\n"
-        "• <b>Защитник</b> обязан побить каждую атакующую карту или взять все карты со стола.\n\n"
-        "<b>Как бить:</b>\n"
-        "• Картой той же масти более высокого номинала.\n"
-        "• Или любым козырем, если атакующая карта не козырная.\n\n"
-        "<b>Подкидывание:</b>\n"
-        "• После первой карты атакующий может подкидывать карты только тех номиналов, которые уже есть на столе.\n"
-        "• Максимум карт на столе за один ход — <b>4</b> (и не больше количества карт у защитника).\n\n"
-        "<b>Взять:</b>\n"
-        "• Защитник может нажать «Взять» и забрать все карты со стола.\n"
-        "• После «Взять» другие игроки (кроме защитника) могут подкинуть карты по номиналам со стола.\n\n"
-        "<b>Бито:</b>\n"
-        "• Когда все карты побиты, <b>атакующий</b> нажимает «Бито» — карты уходят в сброс.\n\n"
-        "<b>Добор:</b>\n"
-        "• После завершения хода игроки добирают карты из колоды до 6 (сначала атакующий, далее по кругу).\n\n"
-        "<b>Конец игры:</b>\n"
-        "• Когда колода закончилась, игроки, у которых нет карт, считаются вышедшими.\n"
-        "• Последний игрок, у которого остались карты, — <b>дурак</b>.\n\n"
-        "<b>Правила использования бота:</b>\n"
-        "• Карты выбираются кнопками.\n"
-        "• Для общения используйте: <code>/say текст</code> (сообщение будет удалено автоматически).\n"
-        "• Кнопка «Выйти» требует подтверждения.\n"
+        "<b>📜 Правила и справка</b>\n\n"
+        "<b>🃏 Игра «Дурак» (подкидной, 36 карт)</b>\n"
+        "• Колода: 36 карт (6–A). Козырь — нижняя карта колоды.\n"
+        "• Игроки: 2–4.\n"
+        "• Раздача: по 6 карт каждому.\n"
+        "• Цель: избавиться от всех карт. Последний с картами — дурак.\n\n"
+        "<b>🧭 Ход игры</b>\n"
+        "• Первый атакующий — игрок с самым младшим козырем.\n"
+        "• Атака: атакующий кладёт карту(ы) на стол.\n"
+        "• Защита: защитник бьёт каждой картой или берёт все карты со стола.\n"
+        "• Подкидывание: подкидывать можно только карты тех же номиналов, что уже на столе.\n"
+        "• Максимум карт на столе за ход — <b>4</b> (и не больше карт у защитника).\n"
+        "• «Бито»: когда все карты побиты, атакующий завершает ход.\n"
+        "• Добор: после хода игроки добирают до 6, начиная с атакующего.\n\n"
+        "<b>💬 Чат во время игры</b>\n"
+        "• Просто пиши сообщение — его увидят все игроки.\n"
+        "• Сообщения удаляются автоматически через несколько секунд, чтобы не мешать игре.\n\n"
+        "<b>🛎️ Как пользоваться ботом</b>\n"
+        "• Все действия с картами — кнопками.\n"
+        "• Выход из лобби/игры требует подтверждения.\n"
+        "• В закрытое лобби вход по коду приглашения.\n"
+        "• Обратная связь — кнопка «Сообщение админу» в меню.\n"
     )
 
 
@@ -1540,7 +1738,8 @@ def rules_text() -> str:
 # =========================
 def render_lobby_text(lobby: Lobby) -> str:
     lines = []
-    lines.append(f"<b>Лобби</b> <code>{lobby.lobby_id}</code>")
+    lines.append(f"<b>♦ Лобби</b> <code>{lobby.lobby_id}</code>")
+    lines.append("────────────────")
     mode_ru = (
         "открытое" if lobby.mode == LobbyMode.open else ("закрытое" if lobby.mode == LobbyMode.closed else "против ИИ")
     )
@@ -1549,19 +1748,31 @@ def render_lobby_text(lobby: Lobby) -> str:
         diff_ru = {"easy": "лёгкий", "normal": "нормальный", "hard": "тяжёлый"}[lobby.ai_difficulty.value]
         lines.append(f"Сложность: <b>{diff_ru}</b>")
     if lobby.mode == LobbyMode.closed and lobby.code:
-        lines.append(f"Код: <code>{lobby.code}</code>")
-    lines.append(f"Статус: <b>{'ожидание' if lobby.status == LobbyStatus.waiting else 'игра'}</b>")
+        lines.append(f"Код приглашения: <code>{lobby.code}</code>")
+    status_ru = "ожидание" if lobby.status == LobbyStatus.waiting else "игра"
+    lines.append(f"Статус: <b>{status_ru}</b>")
     lines.append("")
-    lines.append("<b>Игроки:</b>")
+    lines.append("<b>Игроки</b> (2–4)")
     for p in lobby.players:
-        c = f"{COLOR_EMOJI.get(p.color,'⬜')} {COLOR_NAME_RU.get(p.color,'без цвета')}"
+        default_emoji = "🂡"
+        default_color = "без цвета"
+        c = f"{COLOR_EMOJI.get(p.color, default_emoji)} {COLOR_NAME_RU.get(p.color, default_color)}"
         owner = " (хост)" if p.user_id == lobby.owner_id else ""
         ai = " 🤖" if p.is_ai else ""
         lines.append(f"• {p.name}{ai}{owner} — {c}")
     lines.append("")
-    lines.append("Выбери цвет и нажми «Начать игру».")
+    if lobby.status == LobbyStatus.waiting:
+        lines.append("<b>Подсказка</b>")
+        if lobby.mode == LobbyMode.open:
+            lines.append("• Идёт подбор игроков. Выбери цвет и ожидай начала.")
+        elif lobby.mode == LobbyMode.closed:
+            lines.append("• Поделись кодом с друзьями и выбери цвет.")
+        else:
+            lines.append("• Выбери цвет и нажми «Начать игру».")
+    else:
+        lines.append("<b>Игра в процессе</b>")
+        lines.append("• Нажми «Обновить», если нужно.")
     return "\n".join(lines)
-
 
 def _result_block_for_player(lobby: Lobby, gs: GameState, me: Player) -> str:
     if lobby.status != LobbyStatus.finished and gs.phase != TurnPhase.finished:
@@ -1583,7 +1794,7 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
         p = engine.seat_player(lobby, seat)
         if not p:
             return "—"
-        col = COLOR_EMOJI.get(p.color, "⬜")
+        col = COLOR_EMOJI.get(p.color, "🂡")
         ai = " 🤖" if p.is_ai else ""
         return f"{col} {p.name}{ai}"
 
@@ -1593,50 +1804,12 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
         diff_ru = {"easy": "лёгкий", "normal": "нормальный", "hard": "тяжёлый"}[lobby.ai_difficulty.value]
         lines.append(f"Сложность: <b>{diff_ru}</b>")
     lines.append(f"Козырь: <b>{gs.trump.symbol}</b> • Козырная карта: <b>{gs.trump_card.label_ru}</b>")
-    lines.append(f"В колоде: <b>{len(gs.deck)}</b> карт")
+    lines.append(f"Колода: <b>{len(gs.deck)}</b> • Сброс: <b>{len(gs.discard)}</b>")
+    lines.append(f"Ходит: <b>{seat_name(gs.attacker_seat)}</b> • Защищается: <b>{seat_name(gs.defender_seat)}</b>")
     lines.append("")
-    lines.append(f"Атакует: <b>{seat_name(gs.attacker_seat)}</b>")
-    lines.append(f"Защищается: <b>{seat_name(gs.defender_seat)}</b>")
-
-    if lobby.status == LobbyStatus.playing:
-        if gs.took:
-            if me.seat == gs.defender_seat:
-                lines.append("")
-                lines.append("<b>⚠️ Ты берёшь карты!</b>")
-                lines.append("Жди, пока соперники подкинут и нажмут «Подкинуть выбранные» (или ничего не подкинут).")
-            else:
-                lines.append("")
-                lines.append("<b>⚠️ Защитник берёт карты!</b>")
-                lines.append("Подкинь по номиналам со стола и нажми «Подкинуть выбранные» (или не подкидывай).")
-
-        if gs.phase == TurnPhase.attack_select:
-            if me.seat == gs.attacker_seat:
-                sel = gs.pending_attack.get(me.seat, [])
-                lines.append("")
-                lines.append(f"Твой ход: выбери карты и нажми <b>«Кинуть выбранные»</b>. Выбрано: <b>{len(sel)}</b>")
-            else:
-                lines.append("")
-                lines.append("Ожидаем ход атакующего…")
-        elif gs.phase == TurnPhase.defend:
-            if me.seat == gs.defender_seat:
-                lines.append("")
-                lines.append("Твоя защита: нажимай карты, чтобы <b>побить</b>, или нажми <b>«Взять»</b>.")
-            else:
-                lines.append("")
-                lines.append("Ожидаем защиту…")
-        elif gs.phase == TurnPhase.throwin_select:
-            if me.seat == gs.defender_seat:
-                lines.append("")
-                lines.append("Ты берёшь карты. Остальные могут подкинуть по номиналам со стола.")
-            else:
-                sel = gs.pending_throwin.get(me.seat, [])
-                lines.append("")
-                lines.append(f"Подкидывание: выбери карты и нажми <b>«Подкинуть выбранные»</b>. Выбрано: <b>{len(sel)}</b>")
-
-    lines.append("")
-    lines.append("<b>Карты у игроков:</b>")
+    lines.append("<b>Игроки:</b>")
     for p in lobby.players:
-        col = COLOR_EMOJI.get(p.color, "⬜")
+        col = COLOR_EMOJI.get(p.color, "🂡")
         you = " (ты)" if p.user_id == me.user_id else ""
         ai = " 🤖" if p.is_ai else ""
         lines.append(f"• {col} {p.name}{ai}{you}: <b>{len(p.hand)}</b>")
@@ -1662,6 +1835,7 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
 lobbies = LobbyManager()
 engine = GameEngine()
 awaiting_code: Set[int] = set()
+awaiting_admin_message: Set[int] = set()
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY)
 
@@ -1731,7 +1905,7 @@ async def update_game_ui(bot: Bot, lobby: Lobby, gs: GameState):
 
 
 # =========================
-# Chat (/say) with deletion
+# Chat with auto-delete
 # =========================
 async def broadcast_say(bot: Bot, lobby: Lobby, from_player: Player, text: str):
     prefix = f"💬 <b>{from_player.name}</b>: "
@@ -1769,7 +1943,7 @@ async def cmd_say(message: Message, bot: Bot):
     await safe_delete_message(bot, message.chat.id, message.message_id)
 
     if len(parts) < 2 or not parts[1].strip():
-        warn = await message.answer("Использование: /say текст")
+        warn = await message.answer("Просто напиши сообщение — оно попадёт в чат игры.")
         asyncio.create_task(delete_later(bot, warn.chat.id, warn.message_id, 3.0))
         return
 
@@ -1786,13 +1960,31 @@ async def cmd_say(message: Message, bot: Bot):
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     awaiting_code.discard(message.from_user.id)
-    await message.answer("Меню игры «Дурак».\n\nЧат: /say текст", reply_markup=kb_menu())
+    awaiting_admin_message.discard(message.from_user.id)
+    record_user_event(message.from_user.id, "launch")
+    await message.answer(
+        render_main_menu_text(message.from_user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_menu(),
+    )
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     awaiting_code.discard(message.from_user.id)
-    await message.answer("Меню:", reply_markup=kb_menu())
+    awaiting_admin_message.discard(message.from_user.id)
+    await message.answer(
+        render_main_menu_text(message.from_user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_menu(),
+    )
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+    await message.answer(render_admin_text(), parse_mode=ParseMode.HTML, reply_markup=kb_admin())
 
 
 @router.callback_query(F.data == CB.MENU_HELP)
@@ -1801,10 +1993,69 @@ async def cb_help(call: CallbackQuery):
     await call.message.edit_text(rules_text(), parse_mode=ParseMode.HTML, reply_markup=kb_menu())
 
 
+@router.callback_query(F.data == CB.MENU_ADMIN_MSG)
+async def cb_menu_admin_msg(call: CallbackQuery):
+    await call.answer()
+    uid = call.from_user.id
+    awaiting_code.discard(uid)
+    if ADMIN_USER_ID <= 0 or not is_admin_msg_enabled():
+        await call.message.edit_text(
+            f"<b>✉️ Сообщения админу временно отключены.</b>\n\n{render_main_menu_text(call.from_user, compact=True)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_menu(),
+        )
+        return
+    awaiting_admin_message.add(uid)
+    await call.message.edit_text(
+        "<b>✉️ Сообщение админу</b>\n\nНапиши свой текст одним сообщением. Я отправлю его лично.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_admin_msg_cancel(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_MSG_CANCEL)
+async def cb_admin_msg_cancel(call: CallbackQuery):
+    await call.answer()
+    awaiting_admin_message.discard(call.from_user.id)
+    await call.message.edit_text(
+        f"<b>Отменено.</b>\n\n{render_main_menu_text(call.from_user, compact=True)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_menu(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_REFRESH)
+async def cb_admin_refresh(call: CallbackQuery):
+    if call.from_user.id != ADMIN_USER_ID:
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text(render_admin_text(), parse_mode=ParseMode.HTML, reply_markup=kb_admin())
+
+
+@router.callback_query(F.data == CB.ADMIN_SETTINGS)
+async def cb_admin_settings(call: CallbackQuery):
+    if call.from_user.id != ADMIN_USER_ID:
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text(render_admin_settings_text(), parse_mode=ParseMode.HTML, reply_markup=kb_admin_settings())
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_MSG)
+async def cb_admin_toggle_msg(call: CallbackQuery):
+    if call.from_user.id != ADMIN_USER_ID:
+        await call.answer()
+        return
+    set_bool_setting("admin_msg_enabled", not is_admin_msg_enabled())
+    await call.answer("Готово")
+    await call.message.edit_text(render_admin_settings_text(), parse_mode=ParseMode.HTML, reply_markup=kb_admin_settings())
+
+
 @router.callback_query(F.data == CB.MENU_AI)
 async def cb_menu_ai(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("Выбери сложность ИИ:", reply_markup=kb_ai_difficulty())
+    await call.message.edit_text("🤖 Выбери сложность ИИ:", reply_markup=kb_ai_difficulty())
 
 
 @router.callback_query(F.data.startswith(CB.AI_DIFF))
@@ -1845,7 +2096,13 @@ async def cb_ai_diff(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "back:menu")
 async def cb_back_menu(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("Меню:", reply_markup=kb_menu())
+    awaiting_code.discard(call.from_user.id)
+    awaiting_admin_message.discard(call.from_user.id)
+    await call.message.edit_text(
+        render_main_menu_text(call.from_user, compact=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_menu(),
+    )
 
 
 @router.callback_query(F.data == CB.MENU_OPEN)
@@ -1894,9 +2151,10 @@ async def cb_closed_create(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_JOIN)
 async def cb_join(call: CallbackQuery):
     await call.answer()
+    awaiting_admin_message.discard(call.from_user.id)
     awaiting_code.add(call.from_user.id)
     await call.message.edit_text(
-        "Введи код лобби сообщением (например: <code>AB12CD</code>).",
+        "🔑 Введи код лобби одним сообщением. Пример: <code>AB12CD</code>.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="Назад в меню", callback_data="back:menu")]]
@@ -1907,8 +2165,9 @@ async def cb_join(call: CallbackQuery):
 @router.message(F.text)
 async def msg_text(message: Message, bot: Bot):
     uid = message.from_user.id
+    text = (message.text or "").strip()
     if uid in awaiting_code:
-        code = (message.text or "").strip().upper()
+        code = text.upper()
         awaiting_code.discard(uid)
 
         existing = lobbies.get_lobby_by_player(uid)
@@ -1929,6 +2188,60 @@ async def msg_text(message: Message, bot: Bot):
         me.ui_chat_id = sent.chat.id
         me.ui_message_id = sent.message_id
         await update_lobby_ui(bot, lobby)
+        return
+
+    if uid in awaiting_admin_message:
+        awaiting_admin_message.discard(uid)
+        if not text or text.startswith("/"):
+            await message.answer(
+                f"<b>Отменено.</b>\n\n{render_main_menu_text(message.from_user, compact=True)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_menu(),
+            )
+            return
+        if ADMIN_USER_ID <= 0 or not is_admin_msg_enabled():
+            await message.answer(
+                f"<b>✉️ Сообщения админу временно отключены.</b>\n\n{render_main_menu_text(message.from_user, compact=True)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_menu(),
+            )
+            return
+        sender = human_name(message.from_user)
+        try:
+            await bot.send_message(
+                ADMIN_USER_ID,
+                f"<b>✉️ Сообщение админу</b>\nОт: {sender} (<code>{uid}</code>)\n\n{text}",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        await message.answer(
+            f"<b>Готово!</b> Сообщение отправлено.\n\n{render_main_menu_text(message.from_user, compact=True)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_menu(),
+        )
+        return
+
+    if text.startswith("/"):
+        return
+
+    lobby = lobbies.get_lobby_by_player(uid)
+    if lobby and lobby.status == LobbyStatus.playing:
+        if not text:
+            return
+        ts = now_ts()
+        if ts - last_say_ts.get(uid, 0) < 2.0:
+            await safe_delete_message(bot, message.chat.id, message.message_id)
+            warn = await message.answer("Слишком часто. Подожди немного.")
+            asyncio.create_task(delete_later(bot, warn.chat.id, warn.message_id, 3.0))
+            return
+        last_say_ts[uid] = ts
+        from_player = next((p for p in lobby.players if p.user_id == uid), None)
+        if not from_player:
+            return
+        await safe_delete_message(bot, message.chat.id, message.message_id)
+        await broadcast_say(bot, lobby, from_player, text)
         return
 
 
@@ -2056,6 +2369,9 @@ async def cb_lobby_start(call: CallbackQuery, bot: Bot):
 
     lobby.status = LobbyStatus.playing
     gs = engine.start_game(lobby)
+    for p in lobby.players:
+        if not p.is_ai:
+            record_user_event(p.user_id, "play")
 
     for p in lobby.players:
         if p.is_ai:
@@ -2295,6 +2611,7 @@ async def start_render_server() -> asyncio.AbstractServer:
 # Main
 # =========================
 async def main():
+    init_stats_db()
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
