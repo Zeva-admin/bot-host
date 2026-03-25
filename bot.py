@@ -44,7 +44,7 @@ AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
 AI_MODEL_NORMAL = "llama-3.3-70b-versatile"
 AI_MODEL_HARD = "openai/gpt-oss-120b"
 
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "7053001262"))
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "7053001262, 7719220317"))
 STATS_DB_PATH = Path("casino_stats.db")
 
 # =========================
