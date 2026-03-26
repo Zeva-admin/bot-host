@@ -44,11 +44,7 @@ AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
 AI_MODEL_NORMAL = "llama-3.3-70b-versatile"
 AI_MODEL_HARD = "openai/gpt-oss-120b"
 
-ADMIN_USER_IDS = (7053001262, 7719220317)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "7053001262"))
 STATS_DB_PATH = Path("casino_stats.db")
 
 # =========================
@@ -671,7 +667,7 @@ class LobbyManager:
 
 
 # =========================
-# Game Enine
+# Game Engine
 # =========================
 class GameEngine:
     def __init__(self):
@@ -1986,7 +1982,7 @@ async def cmd_menu(message: Message):
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id != ADMIN_USER_ID:
         return
     await message.answer(render_admin_text(), parse_mode=ParseMode.HTML, reply_markup=kb_admin())
 
@@ -2002,7 +1998,7 @@ async def cb_menu_admin_msg(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
     awaiting_code.discard(uid)
-    if not ADMIN_USER_IDS or not is_admin_msg_enabled():
+    if ADMIN_USER_ID <= 0 or not is_admin_msg_enabled():
         await call.message.edit_text(
             f"<b>✉️ Сообщения админу временно отключены.</b>\n\n{render_main_menu_text(call.from_user, compact=True)}",
             parse_mode=ParseMode.HTML,
@@ -2030,7 +2026,7 @@ async def cb_admin_msg_cancel(call: CallbackQuery):
 
 @router.callback_query(F.data == CB.ADMIN_REFRESH)
 async def cb_admin_refresh(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != ADMIN_USER_ID:
         await call.answer()
         return
     await call.answer()
@@ -2039,7 +2035,7 @@ async def cb_admin_refresh(call: CallbackQuery):
 
 @router.callback_query(F.data == CB.ADMIN_SETTINGS)
 async def cb_admin_settings(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != ADMIN_USER_ID:
         await call.answer()
         return
     await call.answer()
@@ -2048,7 +2044,7 @@ async def cb_admin_settings(call: CallbackQuery):
 
 @router.callback_query(F.data == CB.ADMIN_TOGGLE_MSG)
 async def cb_admin_toggle_msg(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != ADMIN_USER_ID:
         await call.answer()
         return
     set_bool_setting("admin_msg_enabled", not is_admin_msg_enabled())
@@ -2203,7 +2199,7 @@ async def msg_text(message: Message, bot: Bot):
                 reply_markup=kb_menu(),
             )
             return
-        if not ADMIN_USER_IDS or not is_admin_msg_enabled():
+        if ADMIN_USER_ID <= 0 or not is_admin_msg_enabled():
             await message.answer(
                 f"<b>✉️ Сообщения админу временно отключены.</b>\n\n{render_main_menu_text(message.from_user, compact=True)}",
                 parse_mode=ParseMode.HTML,
@@ -2211,16 +2207,15 @@ async def msg_text(message: Message, bot: Bot):
             )
             return
         sender = human_name(message.from_user)
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"<b>✉️ Сообщение админу</b>\nОт: {sender} (<code>{uid}</code>)\n\n{text}",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
+        try:
+            await bot.send_message(
+                ADMIN_USER_ID,
+                f"<b>✉️ Сообщение админу</b>\nОт: {sender} (<code>{uid}</code>)\n\n{text}",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
         await message.answer(
             f"<b>Готово!</b> Сообщение отправлено.\n\n{render_main_menu_text(message.from_user, compact=True)}",
             parse_mode=ParseMode.HTML,
