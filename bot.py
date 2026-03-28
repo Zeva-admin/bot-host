@@ -43,13 +43,14 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8788323258:AAESyyBf_-S2MHuklb0bTJrgls_am0Wazm4"
+TOKEN = "8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
 GROQ_API_KEY = "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"
 CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
 AI_MODEL_NORMAL = "llama-3.3-70b-versatile"
 AI_MODEL_HARD = "openai/gpt-oss-120b"
 ADMIN_USER_ID = 7053001262
+ADMIN_USER_IDS = {7053001262, 7719220317}
 STATS_DB_PATH = Path("casino_stats.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres").strip()
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "-1003691561522").strip()
@@ -127,6 +128,24 @@ def check_db_connection() -> None:
         log_message(f"DB подключение OK ({db.db_kind})")
     except Exception as e:
         log_message(f"DB подключение НЕ удалось ({db.db_kind}): {e}")
+
+
+def validate_config() -> bool:
+    ok = True
+    if not TOKEN:
+        log_message("ОШИБКА: BOT_TOKEN не задан. Бот не может быть запущен.")
+        ok = False
+    if not DATABASE_URL:
+        log_message("Внимание: DATABASE_URL не задан — будет использоваться локальная SQLite.")
+    if not CRYPTOBOT_TOKEN:
+        log_message("Внимание: CRYPTOBOT_TOKEN не задан — ставки будут отключены.")
+        try:
+            db.set_bool_setting("betting_enabled", False)
+        except Exception:
+            pass
+    if not REQUIRED_CHANNEL:
+        log_message("Внимание: REQUIRED_CHANNEL не задан — доступ без проверки подписки.")
+    return ok
 
 # =============================================================================
 # БАЗА ДАННЫХ (УМНАЯ, ВСЁ В ОДНОМ ФАЙЛЕ)
@@ -581,9 +600,10 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            is_p1 = cursor.execute(
+            cursor.execute(
                 "SELECT player1_id FROM betting_matches WHERE match_id = ?", (match_id,)
-            ).fetchone()
+            )
+            is_p1 = cursor.fetchone()
             
             if is_p1 and is_p1[0] == user_id:
                 cursor.execute(
@@ -655,21 +675,30 @@ class Database:
                 WHERE id = ?
             """, (crypto_hash, payment_id))
             
-            match = cursor.execute(
+            cursor.execute(
                 "SELECT player1_id, player2_id, status FROM betting_matches WHERE match_id = ?",
                 (match_id,)
-            ).fetchone()
+            )
+            match = cursor.fetchone()
             
             if match:
-                p1_paid = cursor.execute("""
+                cursor.execute(
+                    """
                     SELECT COUNT(*) FROM betting_payments
                     WHERE match_id = ? AND user_id = ? AND status = 'paid'
-                """, (match_id, match[0])).fetchone()[0] > 0
+                    """,
+                    (match_id, match[0]),
+                )
+                p1_paid = cursor.fetchone()[0] > 0
                 
-                p2_paid = cursor.execute("""
+                cursor.execute(
+                    """
                     SELECT COUNT(*) FROM betting_payments
                     WHERE match_id = ? AND user_id = ? AND status = 'paid'
-                """, (match_id, match[1])).fetchone()[0] > 0
+                    """,
+                    (match_id, match[1]),
+                )
+                p2_paid = cursor.fetchone()[0] > 0
                 
                 if p1_paid and p2_paid and match[2] == 'waiting_payment':
                     cursor.execute(
@@ -1363,7 +1392,7 @@ class CryptoBotClient:
     def __init__(self, token: str):
         self.token = token
         self.base_url = "https://pay.crypt.bot/api"
-        self.enabled = bool(token and token != "YOUR_CRYPTOBOT_TOKEN_HERE")
+        self.enabled = bool(token)
         self._session: Optional[aiohttp.ClientSession] = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -2608,7 +2637,7 @@ SUPPORT_CATEGORIES = [
 
 
 def is_admin(uid: int) -> bool:
-    return uid == ADMIN_USER_ID
+    return uid in ADMIN_USER_IDS
 
 
 def is_admin_msg_enabled() -> bool:
@@ -5297,11 +5326,15 @@ async def msg_any(message: Message, bot: Bot):
                     ]
                 ]
             )
-            await bot.send_message(
-                ADMIN_USER_ID,
-                f"🆘 Новое обращение #{ticket_id}\nТип: {category}\nОт: {sender} ({uid})\n\n{text}",
-                reply_markup=kb,
-            )
+            for admin_id in ADMIN_USER_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"🆘 Новое обращение #{ticket_id}\nТип: {category}\nОт: {sender} ({uid})\n\n{text}",
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
         return
@@ -5656,10 +5689,14 @@ async def finalize_betting_payout(bot: Bot, lobby: Lobby, gs: GameState):
             except Exception:
                 pass
             try:
-                await bot.send_message(
-                    ADMIN_USER_ID,
-                    f"Ошибка создания чека по матчу {match_id} для пользователя {winner_id}: {e}",
-                )
+                for admin_id in ADMIN_USER_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"Ошибка создания чека по матчу {match_id} для пользователя {winner_id}: {e}",
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 async def update_game_ui(bot: Bot, lobby: Lobby, gs: GameState):
@@ -5902,6 +5939,8 @@ async def cleanup_task(bot: Bot):
 async def main():
     db._init_db()
     check_db_connection()
+    if not validate_config():
+        return
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
@@ -5910,7 +5949,7 @@ async def main():
     log_message("Бот запущен")
     status_icon = "\u2705" if cryptobot.enabled else "\u274c"
     log_message(f"CryptoBot: {status_icon}")
-    log_message(f"Admin ID: {ADMIN_USER_ID}")
+    log_message(f"Admin IDs: {', '.join(str(x) for x in sorted(ADMIN_USER_IDS))}")
     try:
         loop = asyncio.get_running_loop()
         def _shutdown():
