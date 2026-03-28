@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
@@ -51,6 +51,9 @@ AI_MODEL_HARD = "openai/gpt-oss-120b"
 ADMIN_USER_ID = 7053001262
 STATS_DB_PATH = Path("casino_stats.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres").strip()
+REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "-1003691561522").strip()
+REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
+NEWS_CHANNEL_URL = os.environ.get("NEWS_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
 LOBBY_IDLE_TIMEOUT = 300  # 5 минут
 AFK_PROMPT_DELAY = 120    # 2 минуты без хода
 AFK_PROMPT_WINDOW = 60    # окно подтверждения (до 3-й минуты)
@@ -96,6 +99,11 @@ def now_ts() -> float:
     return time.time()
 
 START_TS = now_ts()
+SUBSCRIPTION_CACHE: Dict[int, float] = {}
+SUBSCRIPTION_TTL = 300.0
+NOTICE_CACHE: Dict[str, Optional[object]] = {"ts": 0.0, "text": None}
+USER_SETTINGS_CACHE: Dict[int, Tuple[float, dict]] = {}
+USER_SETTINGS_TTL = 60.0
 
 def gen_code(k: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -884,6 +892,146 @@ class Database:
             stats['active_broadcasts'] = cursor.fetchone()[0]
             
             return stats
+        finally:
+            conn.close()
+
+    def ping_ms(self) -> Tuple[bool, Optional[float], Optional[str]]:
+        conn = None
+        try:
+            start = time.perf_counter()
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            ms = (time.perf_counter() - start) * 1000.0
+            return True, ms, None
+        except Exception as e:
+            return False, None, str(e)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def reset_all_data(self) -> bool:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        tables = [
+            "support_messages",
+            "support_tickets",
+            "betting_payouts",
+            "betting_payments",
+            "betting_matches",
+            "user_events",
+            "user_balances",
+            "user_settings",
+            "admin_broadcasts",
+            "kv_settings",
+        ]
+        try:
+            for t in tables:
+                cursor.execute(f"DELETE FROM {t}")
+            # Базовые настройки
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("admin_msg_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("betting_enabled", "1"),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            log_message(f"Ошибка очистки БД: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def cleanup_older_than(self, seconds: float) -> Dict[str, int]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        counts: Dict[str, int] = {}
+        seconds_i = max(1, int(round(seconds)))
+        cutoff_ts = now_ts() - seconds_i
+        try:
+            cursor.execute("DELETE FROM user_events WHERE ts < ?", (cutoff_ts,))
+            counts["user_events"] = cursor.rowcount
+
+            if self.db_kind == "postgres":
+                cursor.execute(
+                    "DELETE FROM support_messages WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["support_messages"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM support_tickets WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["support_tickets"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_payouts WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["betting_payouts"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_payments WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["betting_payments"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_matches WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["betting_matches"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM admin_broadcasts WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["admin_broadcasts"] = cursor.rowcount
+            else:
+                delta = f"-{seconds_i} seconds"
+                cursor.execute(
+                    "DELETE FROM support_messages WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["support_messages"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM support_tickets WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["support_tickets"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_payouts WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["betting_payouts"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_payments WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["betting_payments"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM betting_matches WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["betting_matches"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM admin_broadcasts WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["admin_broadcasts"] = cursor.rowcount
+
+            conn.commit()
+            return counts
+        except Exception as e:
+            log_message(f"Ошибка очистки БД по времени: {e}")
+            conn.rollback()
+            return {}
         finally:
             conn.close()
 
@@ -2362,6 +2510,7 @@ awaiting_support_message: Set[int] = set()
 awaiting_support_category: Dict[int, str] = {}
 awaiting_support_reply: Dict[int, int] = {}
 awaiting_admin_broadcast: Dict[int, dict] = {}
+awaiting_admin_cleanup: Dict[int, dict] = {}
 awaiting_payment: Dict[int, dict] = {}
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY) if Groq else None
@@ -2432,6 +2581,12 @@ class CB:
     ADMIN_SYSTEM = "a:system"
     ADMIN_TOGGLE_MSG = "a:toggle_msg"
     ADMIN_TOGGLE_BETTING = "a:toggle_betting"
+    ADMIN_CLEANUP = "a:cleanup"
+    ADMIN_CLEANUP_FULL = "a:cleanup:full"
+    ADMIN_CLEANUP_FULL_CONFIRM = "a:cleanup:full:confirm"
+    ADMIN_CLEANUP_TIME = "a:cleanup:time"
+    ADMIN_CLEANUP_UNIT = "a:cleanup:unit:"
+    ADMIN_CLEANUP_CANCEL = "a:cleanup:cancel"
     ADMIN_MSG_CANCEL = "a:cancel"
     SUPPORT_CANCEL = "s:cancel"
     SUPPORT_TYPE = "s:type:"
@@ -2439,6 +2594,7 @@ class CB:
     SUPPORT_CLOSE = "s:close:"
     PROFILE_TOGGLE_PHOTO = "p:photo"
     PROFILE_TOGGLE_NOTIFY = "p:notify"
+    CHECK_SUB = "m:check_sub"
 
 
 SUPPORT_CATEGORIES = [
@@ -2470,6 +2626,105 @@ async def safe_answer(call: CallbackQuery, text: str = None, show_alert: bool = 
         pass
 
 
+def _channel_url() -> str:
+    if REQUIRED_CHANNEL_URL:
+        return REQUIRED_CHANNEL_URL
+    if REQUIRED_CHANNEL:
+        if REQUIRED_CHANNEL.startswith("@"):
+            return f"https://t.me/{REQUIRED_CHANNEL[1:]}"
+        if REQUIRED_CHANNEL.startswith("https://"):
+            return REQUIRED_CHANNEL
+    return ""
+
+
+def _news_url() -> str:
+    if NEWS_CHANNEL_URL:
+        return NEWS_CHANNEL_URL
+    return _channel_url()
+
+
+async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    if not REQUIRED_CHANNEL:
+        return True
+    cached_ts = SUBSCRIPTION_CACHE.get(user_id, 0.0)
+    if now_ts() - cached_ts < SUBSCRIPTION_TTL:
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        status = getattr(member, "status", "")
+        is_member = getattr(member, "is_member", False)
+        if status in ("creator", "administrator", "member") or is_member:
+            SUBSCRIPTION_CACHE[user_id] = now_ts()
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def kb_subscribe() -> InlineKeyboardMarkup:
+    rows = []
+    url = _channel_url()
+    if url:
+        rows.append([InlineKeyboardButton(text="Подписаться", url=url)])
+    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data=CB.CHECK_SUB)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def ensure_subscribed(bot: Bot, chat_id: int, user) -> bool:
+    if await is_user_subscribed(bot, user.id):
+        return True
+    kb = kb_subscribe()
+    text = "Для доступа к боту подпишитесь на канал и нажмите «Я подписался»."
+    await bot.send_message(chat_id, text, reply_markup=kb)
+    return False
+
+
+async def ensure_subscribed_for_call(call: CallbackQuery, bot: Bot) -> bool:
+    if await is_user_subscribed(bot, call.from_user.id):
+        return True
+    await safe_answer(call)
+    text = "Для доступа к боту подпишитесь на канал и нажмите «Я подписался»."
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        text,
+        kb_subscribe(),
+    )
+    return False
+
+
+def get_cached_notice_text() -> Optional[str]:
+    now = now_ts()
+    if now - float(NOTICE_CACHE.get("ts") or 0) < 10:
+        return NOTICE_CACHE.get("text")
+    try:
+        active_notice = db.get_active_broadcast(now)
+        text = active_notice.get("text") if active_notice else None
+    except Exception:
+        text = None
+    NOTICE_CACHE["ts"] = now
+    NOTICE_CACHE["text"] = text
+    return text
+
+
+def get_cached_user_settings(user_id: int) -> dict:
+    cached = USER_SETTINGS_CACHE.get(user_id)
+    if cached:
+        ts, data = cached
+        if now_ts() - ts < USER_SETTINGS_TTL:
+            return data
+    data = db.get_user_settings(user_id)
+    USER_SETTINGS_CACHE[user_id] = (now_ts(), data)
+    return data
+
+
+def update_cached_user_settings(user_id: int, data: dict) -> None:
+    USER_SETTINGS_CACHE[user_id] = (now_ts(), data)
+
+
 def kb_ai_difficulty() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2482,18 +2737,20 @@ def kb_ai_difficulty() -> InlineKeyboardMarkup:
 
 
 def kb_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="\U0001f3b2 Открытая игра", callback_data=CB.MENU_OPEN)],
-            [InlineKeyboardButton(text="\U0001f512 Закрытая игра", callback_data=CB.MENU_CLOSED)],
-            [InlineKeyboardButton(text="\U0001f511 Войти по коду", callback_data=CB.MENU_JOIN)],
-            [InlineKeyboardButton(text="\U0001f916 Игра против ИИ", callback_data=CB.MENU_AI)],
-            [InlineKeyboardButton(text="\U0001f4b0 Игра на ставки", callback_data=CB.MENU_BETTING)],
-            [InlineKeyboardButton(text="\U0001f4d6 Правила", callback_data=CB.MENU_HELP)],
-            [InlineKeyboardButton(text="\U0001f464 Профиль", callback_data=CB.MENU_PROFILE)],
-            [InlineKeyboardButton(text="\U0001f198 Поддержка", callback_data=CB.MENU_ADMIN_MSG)],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text="\U0001f3b2 Открытая игра", callback_data=CB.MENU_OPEN)],
+        [InlineKeyboardButton(text="\U0001f512 Закрытая игра", callback_data=CB.MENU_CLOSED)],
+        [InlineKeyboardButton(text="\U0001f511 Войти по коду", callback_data=CB.MENU_JOIN)],
+        [InlineKeyboardButton(text="\U0001f916 Игра против ИИ", callback_data=CB.MENU_AI)],
+        [InlineKeyboardButton(text="\U0001f4b0 Игра на ставки", callback_data=CB.MENU_BETTING)],
+        [InlineKeyboardButton(text="\U0001f4d6 Правила", callback_data=CB.MENU_HELP)],
+    ]
+    news_url = _news_url()
+    if news_url:
+        rows.append([InlineKeyboardButton(text="\U0001f4f0 Новости", url=news_url)])
+    rows.append([InlineKeyboardButton(text="\U0001f464 Профиль", callback_data=CB.MENU_PROFILE)])
+    rows.append([InlineKeyboardButton(text="\U0001f198 Поддержка", callback_data=CB.MENU_ADMIN_MSG)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_back_menu() -> InlineKeyboardMarkup:
@@ -2626,8 +2883,53 @@ def kb_admin() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Уведомления", callback_data=CB.ADMIN_NOTIFY),
                 InlineKeyboardButton(text="Система", callback_data=CB.ADMIN_SYSTEM),
             ],
+            [InlineKeyboardButton(text="Очистка БД", callback_data=CB.ADMIN_CLEANUP)],
             [InlineKeyboardButton(text="Назад", callback_data="back:menu")],
         ]
+    )
+
+
+def kb_admin_cleanup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Полная очистка", callback_data=CB.ADMIN_CLEANUP_FULL)],
+            [InlineKeyboardButton(text="Очистка по времени", callback_data=CB.ADMIN_CLEANUP_TIME)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_REFRESH)],
+        ]
+    )
+
+
+def kb_admin_cleanup_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, очистить", callback_data=CB.ADMIN_CLEANUP_FULL_CONFIRM)],
+            [InlineKeyboardButton(text="Отмена", callback_data=CB.ADMIN_CLEANUP_CANCEL)],
+        ]
+    )
+
+
+def kb_admin_cleanup_units() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Секунды", callback_data=f"{CB.ADMIN_CLEANUP_UNIT}sec"),
+                InlineKeyboardButton(text="Минуты", callback_data=f"{CB.ADMIN_CLEANUP_UNIT}min"),
+            ],
+            [
+                InlineKeyboardButton(text="Часы", callback_data=f"{CB.ADMIN_CLEANUP_UNIT}hour"),
+                InlineKeyboardButton(text="Дни", callback_data=f"{CB.ADMIN_CLEANUP_UNIT}day"),
+            ],
+            [
+                InlineKeyboardButton(text="Недели", callback_data=f"{CB.ADMIN_CLEANUP_UNIT}week"),
+            ],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_CLEANUP_CANCEL)],
+        ]
+    )
+
+
+def kb_admin_cleanup_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.ADMIN_CLEANUP_CANCEL)]]
     )
 
 
@@ -2656,6 +2958,9 @@ def kb_admin_settings() -> InlineKeyboardMarkup:
 
 def render_admin_text() -> str:
     stats = db.get_admin_stats()
+    db_ok, db_ping_ms, _ = db.ping_ms()
+    db_status = "✅" if db_ok else "❌"
+    db_ping_txt = f"{db_ping_ms:.0f} ms" if db_ping_ms is not None else "—"
     return (
         f"<b>Админ панель</b>\n\n"
         f"💰 Доход (комиссия): ${stats['total_commission']:.2f}\n"
@@ -2665,6 +2970,7 @@ def render_admin_text() -> str:
         f"💵 Балансы: ${stats['total_user_balance']:.2f}\n"
         f"🆘 Открытых тикетов: {stats['open_tickets']}\n"
         f"📢 Уведомлений активно: {stats['active_broadcasts']}\n"
+        f"🗄️ DB: {db_status} • {db_ping_txt}\n"
     )
 
 
@@ -2716,7 +3022,7 @@ def render_admin_notify_text() -> str:
     return "\n".join(lines)
 
 
-def render_admin_system_text() -> str:
+def render_admin_system_text(db_ok: bool, db_ping_ms: Optional[float], db_err: Optional[str], bot_ping_ms: Optional[float]) -> str:
     uptime = int(now_ts() - START_TS)
     hours = uptime // 3600
     minutes = (uptime % 3600) // 60
@@ -2735,17 +3041,38 @@ def render_admin_system_text() -> str:
         crypto_mask = CRYPTOBOT_TOKEN[:4] + "..." + CRYPTOBOT_TOKEN[-4:]
     lines = ["<b>Система</b>", ""]
     lines.append(f"Uptime: {hours}ч {minutes}м")
-    lines.append(f"DB size: {db_size / 1024:.1f} KB")
+    if db.db_kind == "postgres":
+        lines.append("DB size: remote")
+    else:
+        lines.append(f"DB size: {db_size / 1024:.1f} KB")
+    lines.append(f"DB: {'OK' if db_ok else 'Ошибка'} • {db.db_kind}")
+    if db_ping_ms is not None:
+        lines.append(f"DB ping: {db_ping_ms:.0f} ms")
+    if (not db_ok) and db_err:
+        lines.append(f"DB error: {html.escape(db_err)[:120]}")
     lines.append(f"Активных лобби: {len(lobbies.lobbies)}")
     lines.append(f"Активных игр: {len(engine.games)}")
     lines.append(f"Ожидают оплату: {len(awaiting_payment)}")
     lines.append(f"CryptoBot: {status_icon}")
     lines.append(f"AI сервис: {ai_icon}")
+    if bot_ping_ms is not None:
+        lines.append(f"Bot API ping: {bot_ping_ms:.0f} ms")
+    else:
+        lines.append("Bot API ping: —")
     lines.append(f"Token TG: {token_mask}")
     lines.append(f"Token CryptoBot: {crypto_mask}")
     lines.append(f"Host: {platform.system()} {platform.release()}")
     lines.append(f"Python: {platform.python_version()}")
     return "\n".join(lines)
+
+
+async def measure_bot_ping(bot: Bot) -> Optional[float]:
+    try:
+        start = time.perf_counter()
+        await bot.get_me()
+        return (time.perf_counter() - start) * 1000.0
+    except Exception:
+        return None
 
 
 async def show_admin_panel(bot: Bot, chat_id: int, user, message: Message = None):
@@ -3377,6 +3704,8 @@ async def prepare_betting_match(bot: Bot, lobby: Lobby):
 # ------------------------
 
 async def show_menu(bot: Bot, chat_id: int, user, message: Message = None):
+    if not await ensure_subscribed(bot, chat_id, user):
+        return
     text = render_main_menu_text(user)
     if message:
         try:
@@ -3399,6 +3728,8 @@ async def cmd_menu(message: Message, bot: Bot):
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
     await show_admin_panel(bot, message.chat.id, message.from_user)
 
 
@@ -3409,16 +3740,29 @@ async def cb_back_menu(call: CallbackQuery, bot: Bot):
     await show_menu(bot, call.message.chat.id, call.from_user, call.message)
 
 
+@router.callback_query(F.data == CB.CHECK_SUB)
+async def cb_check_sub(call: CallbackQuery, bot: Bot):
+    if await is_user_subscribed(bot, call.from_user.id):
+        await safe_answer(call, "Подписка подтверждена!")
+        await show_menu(bot, call.message.chat.id, call.from_user, call.message)
+        return
+    await safe_answer(call, "Подписка не найдена.", show_alert=True)
+
+
 @router.callback_query(F.data == CB.MENU_HELP)
 async def cb_help(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     await call.message.edit_text(rules_text(), parse_mode=ParseMode.HTML, reply_markup=kb_menu())
 
 
 @router.callback_query(F.data == CB.MENU_PROFILE)
 async def cb_menu_profile(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    settings = db.get_user_settings(call.from_user.id)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
+    settings = get_cached_user_settings(call.from_user.id)
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3431,10 +3775,11 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.PROFILE_TOGGLE_PHOTO)
 async def cb_profile_toggle_photo(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    settings = db.get_user_settings(call.from_user.id)
+    settings = get_cached_user_settings(call.from_user.id)
     new_val = 0 if settings.get("show_card_photos", 1) else 1
     db.set_user_setting(call.from_user.id, "show_card_photos", new_val)
     settings = db.get_user_settings(call.from_user.id)
+    update_cached_user_settings(call.from_user.id, settings)
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3447,10 +3792,11 @@ async def cb_profile_toggle_photo(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.PROFILE_TOGGLE_NOTIFY)
 async def cb_profile_toggle_notify(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    settings = db.get_user_settings(call.from_user.id)
+    settings = get_cached_user_settings(call.from_user.id)
     new_val = 0 if settings.get("allow_broadcast", 1) else 1
     db.set_user_setting(call.from_user.id, "allow_broadcast", new_val)
     settings = db.get_user_settings(call.from_user.id)
+    update_cached_user_settings(call.from_user.id, settings)
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3463,6 +3809,8 @@ async def cb_profile_toggle_notify(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_OPEN)
 async def cb_menu_open(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3711,6 +4059,8 @@ async def cb_open_join(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_CLOSED)
 async def cb_menu_closed(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
         await call.message.edit_text(render_lobby_text(existing), reply_markup=kb_lobby(existing, call.from_user.id), parse_mode=ParseMode.HTML)
@@ -3726,6 +4076,8 @@ async def cb_menu_closed(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_JOIN)
 async def cb_menu_join(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     awaiting_code.add(call.from_user.id)
     await safe_edit_text(
         bot,
@@ -3739,6 +4091,8 @@ async def cb_menu_join(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_AI)
 async def cb_menu_ai(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     await call.message.edit_text("🤖 Выбери сложность ИИ:", reply_markup=kb_ai_difficulty())
 
 
@@ -3771,6 +4125,8 @@ async def cb_ai_diff(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_BETTING)
 async def cb_betting_menu(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     if not is_betting_enabled():
         await safe_edit_text(
             bot,
@@ -4046,6 +4402,8 @@ async def cb_betting_join(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_ADMIN_MSG)
 async def cb_admin_msg(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
     if not is_admin_msg_enabled():
         await safe_edit_text(
             bot,
@@ -4248,12 +4606,121 @@ async def cb_admin_system(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not is_admin(call.from_user.id):
         return
+    db_ok, db_ping_ms, db_err = db.ping_ms()
+    bot_ping_ms = await measure_bot_ping(bot)
     await safe_edit_text(
         bot,
         call.message.chat.id,
         call.message.message_id,
-        render_admin_system_text(),
+        render_admin_system_text(db_ok, db_ping_ms, db_err, bot_ping_ms),
         kb_admin_matches(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_CLEANUP)
+async def cb_admin_cleanup(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    awaiting_admin_cleanup.pop(call.from_user.id, None)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "<b>Очистка БД</b>\n\nВыберите тип очистки:",
+        kb_admin_cleanup(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_CLEANUP_FULL)
+async def cb_admin_cleanup_full(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    text = (
+        "<b>Полная очистка БД</b>\n\n"
+        "Это удалит все данные (матчи, платежи, обращения, события и настройки пользователей).\n"
+        "Подтвердите действие:"
+    )
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        text,
+        kb_admin_cleanup_confirm(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_CLEANUP_FULL_CONFIRM)
+async def cb_admin_cleanup_full_confirm(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    ok = db.reset_all_data()
+    SUBSCRIPTION_CACHE.clear()
+    NOTICE_CACHE["ts"] = 0.0
+    NOTICE_CACHE["text"] = None
+    USER_SETTINGS_CACHE.clear()
+    text = "База очищена и пересоздана." if ok else "Не удалось очистить БД."
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        text,
+        kb_admin_cleanup(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_CLEANUP_TIME)
+async def cb_admin_cleanup_time(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    awaiting_admin_cleanup.pop(call.from_user.id, None)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Очистить данные старше указанного времени. Выберите единицу:",
+        kb_admin_cleanup_units(),
+    )
+
+
+@router.callback_query(F.data.startswith(CB.ADMIN_CLEANUP_UNIT))
+async def cb_admin_cleanup_unit(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    unit = call.data[len(CB.ADMIN_CLEANUP_UNIT):]
+    if unit not in ("sec", "min", "hour", "day", "week"):
+        return
+    awaiting_admin_cleanup[call.from_user.id] = {"unit": unit}
+    unit_ru = {
+        "sec": "секундах",
+        "min": "минутах",
+        "hour": "часах",
+        "day": "днях",
+        "week": "неделях",
+    }[unit]
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        f"Введите число в {unit_ru}:",
+        kb_admin_cleanup_cancel(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_CLEANUP_CANCEL)
+async def cb_admin_cleanup_cancel(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    awaiting_admin_cleanup.pop(call.from_user.id, None)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "<b>Очистка БД</b>\n\nВыберите тип очистки:",
+        kb_admin_cleanup(),
     )
 
 
@@ -4742,6 +5209,10 @@ async def msg_any(message: Message, bot: Bot):
     text = (message.text or "").strip()
     if text.startswith("/"):
         return
+    if REQUIRED_CHANNEL and not is_admin(uid):
+        if not await is_user_subscribed(bot, uid):
+            await ensure_subscribed(bot, message.chat.id, message.from_user)
+            return
     if uid in awaiting_code:
         awaiting_code.discard(uid)
         code = text.upper()
@@ -4801,6 +5272,42 @@ async def msg_any(message: Message, bot: Bot):
         except Exception:
             pass
         await message.answer(f"Ответ по тикету #{ticket_id} отправлен.")
+        return
+    if is_admin(uid) and uid in awaiting_admin_cleanup:
+        state = awaiting_admin_cleanup.pop(uid, {})
+        unit = state.get("unit")
+        if unit not in ("sec", "min", "hour", "day", "week"):
+            await message.answer("Неверная единица времени.")
+            return
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError:
+            await message.answer("Введите число.")
+            return
+        if value <= 0:
+            await message.answer("Введите число больше 0.")
+            return
+        mult = {"sec": 1, "min": 60, "hour": 3600, "day": 86400, "week": 604800}[unit]
+        seconds = value * mult
+        counts = db.cleanup_older_than(seconds)
+        if not counts:
+            await message.answer("Не удалось выполнить очистку.")
+            return
+        total = sum(counts.values())
+        name_map = {
+            "user_events": "события",
+            "support_messages": "сообщения поддержки",
+            "support_tickets": "тикеты",
+            "betting_payouts": "выплаты",
+            "betting_payments": "платежи",
+            "betting_matches": "матчи",
+            "admin_broadcasts": "уведомления",
+        }
+        lines = ["Очистка завершена.", f"Удалено всего: {total}"]
+        for key, val in counts.items():
+            if val:
+                lines.append(f"• {name_map.get(key, key)}: {val}")
+        await message.answer("\n".join(lines))
         return
     if is_admin(uid) and uid in awaiting_admin_broadcast:
         state = awaiting_admin_broadcast.get(uid, {})
@@ -5204,14 +5711,11 @@ def render_main_menu_text(user=None, compact: bool = False) -> str:
     lines.append("Нужна помощь? Загляни в «Правила».")
     show_notice = True
     if user:
-        settings = db.get_user_settings(user.id)
+        settings = get_cached_user_settings(user.id)
         show_notice = bool(settings.get("allow_broadcast", 1))
-    try:
-        active_notice = db.get_active_broadcast(now_ts()) if show_notice else None
-    except Exception:
-        active_notice = None
-    if active_notice and active_notice.get("text"):
-        notice_text = html.escape(active_notice.get("text", ""))
+    notice_text_raw = get_cached_notice_text() if show_notice else None
+    if notice_text_raw:
+        notice_text = html.escape(notice_text_raw)
         lines.append(" ")
         lines.append("📢 Уведомление")
         lines.append(notice_text)
