@@ -2643,6 +2643,51 @@ def _news_url() -> str:
     return _channel_url()
 
 
+def _extract_tg_username(url: str) -> str:
+    if not url:
+        return ""
+    if "t.me/" not in url:
+        return ""
+    part = url.split("t.me/", 1)[1]
+    part = part.split("?", 1)[0].split("/", 1)[0].strip()
+    if not part:
+        return ""
+    if not part.startswith("@"):
+        part = f"@{part}"
+    return part
+
+
+def _channel_candidates() -> List[object]:
+    candidates: List[object] = []
+    seen: Set[str] = set()
+
+    def _add(item: object):
+        key = str(item)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(item)
+
+    rc = REQUIRED_CHANNEL.strip()
+    if rc:
+        if rc.startswith("https://"):
+            uname = _extract_tg_username(rc)
+            if uname:
+                _add(uname)
+        elif rc.startswith("@"):
+            _add(rc)
+        else:
+            try:
+                _add(int(rc))
+            except Exception:
+                _add(rc)
+    url = _channel_url()
+    uname = _extract_tg_username(url)
+    if uname:
+        _add(uname)
+    return candidates
+
+
 async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
     if is_admin(user_id):
         return True
@@ -2651,16 +2696,17 @@ async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
     cached_ts = SUBSCRIPTION_CACHE.get(user_id, 0.0)
     if now_ts() - cached_ts < SUBSCRIPTION_TTL:
         return True
-    try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        status = getattr(member, "status", "")
-        is_member = getattr(member, "is_member", False)
-        if status in ("creator", "administrator", "member") or is_member:
-            SUBSCRIPTION_CACHE[user_id] = now_ts()
-            return True
-        return False
-    except Exception:
-        return False
+    for chat_id in _channel_candidates():
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            status = getattr(member, "status", "")
+            is_member = getattr(member, "is_member", False)
+            if status in ("creator", "administrator", "member", "restricted") or is_member:
+                SUBSCRIPTION_CACHE[user_id] = now_ts()
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def kb_subscribe() -> InlineKeyboardMarkup:
