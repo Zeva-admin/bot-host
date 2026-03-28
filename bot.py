@@ -12,6 +12,7 @@ import logging
 import html
 import platform
 import sys
+import signal
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -104,6 +105,7 @@ SUBSCRIPTION_TTL = 300.0
 NOTICE_CACHE: Dict[str, Optional[object]] = {"ts": 0.0, "text": None}
 USER_SETTINGS_CACHE: Dict[int, Tuple[float, dict]] = {}
 USER_SETTINGS_TTL = 60.0
+SHUTDOWN_EVENT = asyncio.Event()
 
 def gen_code(k: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -5879,9 +5881,12 @@ async def start_render_server() -> asyncio.AbstractServer:
     return await asyncio.start_server(_render_http_handler, host="0.0.0.0", port=port)
 
 async def cleanup_task(bot: Bot):
-    while True:
+    last_log_ts = 0.0
+    while not SHUTDOWN_EVENT.is_set():
         await asyncio.sleep(10)
-        log_message("Очистка просроченных платежей и лобби...")
+        if now_ts() - last_log_ts > 60:
+            log_message("Очистка просроченных платежей и лобби...")
+            last_log_ts = now_ts()
         now = now_ts()
         for user_id, payment in list(awaiting_payment.items()):
             if now - payment.get("start_time", 0) > PAYMENT_TIMEOUT:
@@ -5907,14 +5912,27 @@ async def main():
     log_message(f"CryptoBot: {status_icon}")
     log_message(f"Admin ID: {ADMIN_USER_ID}")
     try:
-        while True:
+        loop = asyncio.get_running_loop()
+        def _shutdown():
+            if not SHUTDOWN_EVENT.is_set():
+                SHUTDOWN_EVENT.set()
+                log_message("Получен сигнал завершения. Останавливаю бота...")
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _shutdown)
+            loop.add_signal_handler(signal.SIGINT, _shutdown)
+        except Exception:
+            pass
+        while not SHUTDOWN_EVENT.is_set():
             try:
                 await dp.start_polling(bot)
-                break
+                if not SHUTDOWN_EVENT.is_set():
+                    log_message("Polling завершился. Перезапуск через 3 секунды.")
+                    await asyncio.sleep(3)
             except Exception as e:
-                log_message(f"Критическая ошибка polling: {e}. Перезапуск через 5 секунд.")
+                log_message(f"Ошибка polling: {e}. Перезапуск через 5 секунд.")
                 await asyncio.sleep(5)
     finally:
+        SHUTDOWN_EVENT.set()
         server.close()
         await server.wait_closed()
         await cryptobot.close()
