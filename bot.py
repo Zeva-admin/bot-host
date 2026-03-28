@@ -428,14 +428,26 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_broadcasts_status ON admin_broadcasts(status)")
         
         # Настройки по умолчанию
-        cursor.execute(
-            "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
-            ("admin_msg_enabled", "1"),
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
-            ("betting_enabled", "1"),
-        )
+        if self.db_kind == "postgres":
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("admin_msg_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("betting_enabled", "1"),
+            )
+        else:
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("admin_msg_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("betting_enabled", "1"),
+            )
         
         conn.commit()
         conn.close()
