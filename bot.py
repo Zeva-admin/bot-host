@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8788323258:AAESyyBf_-S2MHuklb0bTJrgls_am0Wazm4"
+TOKEN = "8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
 GROQ_API_KEY = "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"
 CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
@@ -180,7 +180,10 @@ class Database:
                 def execute(self, query, vars=None):
                     query = query.replace("?", "%s")
                     return super().execute(query, vars)
-            conn = psycopg2.connect(self.db_url, cursor_factory=AdaptCursor)
+            conn_kwargs = {"cursor_factory": AdaptCursor}
+            if self.db_url and "sslmode=" not in self.db_url:
+                conn_kwargs["sslmode"] = "require"
+            conn = psycopg2.connect(self.db_url, **conn_kwargs)
             return conn
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -3038,12 +3041,14 @@ def render_admin_text() -> str:
     db_ok, db_ping_ms, _ = db.ping_ms()
     db_status = "✅" if db_ok else "❌"
     db_ping_txt = f"{db_ping_ms:.0f} ms" if db_ping_ms is not None else "—"
+    total_starts = db.count_unique_users("start", 0)
     return (
         f"<b>Админ панель</b>\n\n"
         f"💰 Доход (комиссия): ${stats['total_commission']:.2f}\n"
         f"🎮 Всего матчей: {stats['total_matches']}\n"
         f"🎯 Активных: {stats['active_matches']}\n"
         f"👥 Пользователей: {stats['total_users']}\n"
+        f"🚀 Первых запусков: {total_starts}\n"
         f"💵 Балансы: ${stats['total_user_balance']:.2f}\n"
         f"🆘 Открытых тикетов: {stats['open_tickets']}\n"
         f"📢 Уведомлений активно: {stats['active_broadcasts']}\n"
@@ -3253,9 +3258,10 @@ def kb_lobby(lobby: Lobby, me_id: int) -> InlineKeyboardMarkup:
         rows.append(color_buttons[:2])
         rows.append(color_buttons[2:])
 
-    can_start = len(lobby.players) >= 2
+    all_colors = all(p.color for p in lobby.players if not p.is_ai)
+    can_start = len(lobby.players) >= 2 and all_colors
     if lobby.mode == LobbyMode.betting:
-        can_start = len(lobby.players) == 2 and all(p.has_paid for p in lobby.players)
+        can_start = len(lobby.players) == 2 and all(p.has_paid for p in lobby.players) and all_colors
     if me_id == lobby.owner_id and lobby.status == LobbyStatus.waiting and can_start:
         rows.insert(0, [InlineKeyboardButton(text="Начать игру", callback_data=CB.LOBBY_START)])
     if me_id == lobby.owner_id and lobby.status == LobbyStatus.waiting:
@@ -3641,6 +3647,7 @@ async def run_ai_loop_until_human_turn(bot: Bot, lobby: Lobby, gs: GameState, ma
                     return
                 ok, _ = engine.defender_take(lobby, ai_player)
                 if ok:
+                    await broadcast_lobby_notice(bot, lobby, f"👐 {ai_player.name} берет карты.")
                     await update_game_ui(bot, lobby, gs)
             elif action.get("type") == "throwin_done":
                 if gs.phase != TurnPhase.throwin_select or ai_player.seat == gs.defender_seat:
@@ -3738,11 +3745,16 @@ async def check_payment_loop(bot: Bot, user_id: int, invoice_id: int, amount: fl
                 await update_lobby_ui(bot, lobby)
                 match = db.get_match_by_lobby(lobby_id)
                 if match and match.get("status") == "ready_to_start":
-                    if lobby.status != LobbyStatus.playing and not engine.get_game(lobby.lobby_id):
-                        lobby.status = LobbyStatus.playing
-                        gs = engine.start_game(lobby)
-                        await update_game_ui(bot, lobby, gs)
-                        await run_ai_loop_until_human_turn(bot, lobby, gs)
+                    for pl in lobby.players:
+                        if pl.is_ai:
+                            continue
+                        try:
+                            await bot.send_message(
+                                pl.user_id,
+                                "✅ Оплата подтверждена. Хост, нажмите «Начать игру».",
+                            )
+                        except Exception:
+                            pass
             awaiting_payment.pop(user_id, None)
             return
         if now_ts() - start_time > PAYMENT_TIMEOUT:
@@ -3795,6 +3807,7 @@ async def show_menu(bot: Bot, chat_id: int, user, message: Message = None):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
+    db.record_user_event(message.from_user.id, "start")
     await show_menu(bot, message.chat.id, message.from_user)
 
 
@@ -4929,6 +4942,9 @@ async def cb_lobby_start(call: CallbackQuery, bot: Bot):
     if lobby.owner_id != call.from_user.id:
         await safe_answer(call, "Только хост может начать игру.", show_alert=True)
         return
+    if any((not p.is_ai) and (not p.color) for p in lobby.players):
+        await safe_answer(call, "Все игроки должны выбрать цвет.", show_alert=True)
+        return
     if lobby.mode == LobbyMode.betting:
         if len(lobby.players) != 2 or not all(p.has_paid for p in lobby.players):
             await safe_answer(call, "Ожидается оплата обоих игроков.", show_alert=True)
@@ -5238,6 +5254,7 @@ async def cb_game_take(call: CallbackQuery, bot: Bot):
     if not ok:
         await safe_answer(call, err, show_alert=True)
         return
+    await broadcast_lobby_notice(bot, lobby, f"👐 {me.name} берет карты.")
     await update_game_ui(bot, lobby, gs)
     await run_ai_loop_until_human_turn(bot, lobby, gs)
 
@@ -5278,6 +5295,11 @@ async def cb_afk_ok(call: CallbackQuery, bot: Bot):
     if not gs or not gs.afk_prompt_active:
         return
     gs.afk_prompt_responses.add(call.from_user.id)
+    try:
+        msg = await bot.send_message(call.from_user.id, "✅ Подтверждено.")
+        asyncio.create_task(delete_later(bot, msg.chat.id, msg.message_id, 2.0))
+    except Exception:
+        pass
 
 
 @router.message()
@@ -5736,6 +5758,18 @@ async def broadcast_say(bot: Bot, lobby: Lobby, from_player: Player, text: str):
         try:
             m = await bot.send_message(p.user_id, msg_text, parse_mode=ParseMode.HTML)
             asyncio.create_task(delete_later(bot, p.user_id, m.message_id, 10.0))
+        except Exception:
+            pass
+
+
+async def broadcast_lobby_notice(bot: Bot, lobby: Lobby, text: str, delete_after: float = 5.0):
+    for p in lobby.players:
+        if p.is_ai:
+            continue
+        try:
+            m = await bot.send_message(p.user_id, text)
+            if delete_after and delete_after > 0:
+                asyncio.create_task(delete_later(bot, p.user_id, m.message_id, delete_after))
         except Exception:
             pass
 
