@@ -486,6 +486,51 @@ class Database:
                 "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
                 ("menu_button_style", "primary"),
             )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("maintenance_mode", "0"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("require_subscription", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("open_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("closed_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("ai_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("news_button_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("broadcasts_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("default_show_card_photos", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("default_allow_broadcast", "1"),
+            )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
@@ -498,6 +543,42 @@ class Database:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
                 ("menu_button_style", "primary"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("maintenance_mode", "0"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("require_subscription", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("open_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("closed_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("ai_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("news_button_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("broadcasts_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("default_show_card_photos", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("default_allow_broadcast", "1"),
             )
         
         conn.commit()
@@ -1102,7 +1183,9 @@ class Database:
             row = cursor.fetchone()
             if row:
                 return dict(row)
-            return {"user_id": user_id, "show_card_photos": 1, "allow_broadcast": 1}
+            show_default = 1 if self.get_bool_setting("default_show_card_photos", True) else 0
+            notify_default = 1 if self.get_bool_setting("default_allow_broadcast", True) else 0
+            return {"user_id": user_id, "show_card_photos": show_default, "allow_broadcast": notify_default}
         finally:
             conn.close()
 
@@ -1112,10 +1195,12 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            show_default = 1 if self.get_bool_setting("default_show_card_photos", True) else 0
+            notify_default = 1 if self.get_bool_setting("default_allow_broadcast", True) else 0
             cursor.execute(
                 "INSERT INTO user_settings (user_id, show_card_photos, allow_broadcast) "
-                "VALUES (?, 1, 1) ON CONFLICT(user_id) DO NOTHING",
-                (user_id,),
+                "VALUES (?, ?, ?) ON CONFLICT(user_id) DO NOTHING",
+                (user_id, show_default, notify_default),
             )
             cursor.execute(
                 f"UPDATE user_settings SET {key} = ? WHERE user_id = ?",
@@ -2630,6 +2715,10 @@ class CB:
     AFK_OK = "g:afk_ok"
     ADMIN_REFRESH = "a:refresh"
     ADMIN_SETTINGS = "a:settings"
+    ADMIN_SETTINGS_ACCESS = "a:settings:access"
+    ADMIN_SETTINGS_MODES = "a:settings:modes"
+    ADMIN_SETTINGS_NOTIFY = "a:settings:notify"
+    ADMIN_SETTINGS_DEFAULTS = "a:settings:defaults"
     ADMIN_SUPPORT = "a:support"
     ADMIN_SUPPORT_OPEN = "a:support:open"
     ADMIN_SUPPORT_ALL = "a:support:all"
@@ -2644,6 +2733,15 @@ class CB:
     ADMIN_TOGGLE_BETTING = "a:toggle_betting"
     ADMIN_MENU_STYLE = "a:menu_style"
     ADMIN_MENU_STYLE_SET = "a:menu_style_set:"
+    ADMIN_TOGGLE_MAINT = "a:toggle_maint"
+    ADMIN_TOGGLE_REQUIRE_SUB = "a:toggle_reqsub"
+    ADMIN_TOGGLE_OPEN = "a:toggle_open"
+    ADMIN_TOGGLE_CLOSED = "a:toggle_closed"
+    ADMIN_TOGGLE_AI = "a:toggle_ai"
+    ADMIN_TOGGLE_NEWS = "a:toggle_news"
+    ADMIN_TOGGLE_BROADCASTS = "a:toggle_broadcasts"
+    ADMIN_TOGGLE_DEFAULT_PHOTO = "a:toggle_def_photo"
+    ADMIN_TOGGLE_DEFAULT_NOTIFY = "a:toggle_def_notify"
     ADMIN_CLEANUP = "a:cleanup"
     ADMIN_CLEANUP_FULL = "a:cleanup:full"
     ADMIN_CLEANUP_FULL_CONFIRM = "a:cleanup:full:confirm"
@@ -2696,6 +2794,44 @@ def next_menu_button_style(current: str) -> str:
 
 def menu_button_style_label(style: str) -> str:
     return MENU_BUTTON_STYLE_LABELS.get(style, "Синий")
+
+
+def is_maintenance_mode() -> bool:
+    return db.get_bool_setting("maintenance_mode", False)
+
+
+def is_subscription_required() -> bool:
+    if not REQUIRED_CHANNEL:
+        return False
+    return db.get_bool_setting("require_subscription", True)
+
+
+def is_open_enabled() -> bool:
+    return db.get_bool_setting("open_enabled", True)
+
+
+def is_closed_enabled() -> bool:
+    return db.get_bool_setting("closed_enabled", True)
+
+
+def is_ai_enabled() -> bool:
+    return db.get_bool_setting("ai_enabled", True)
+
+
+def is_news_enabled() -> bool:
+    return db.get_bool_setting("news_button_enabled", True)
+
+
+def is_broadcasts_enabled() -> bool:
+    return db.get_bool_setting("broadcasts_enabled", True)
+
+
+def default_show_card_photos() -> bool:
+    return db.get_bool_setting("default_show_card_photos", True)
+
+
+def default_allow_broadcast() -> bool:
+    return db.get_bool_setting("default_allow_broadcast", True)
 
 
 async def safe_answer(call: CallbackQuery, text: str = None, show_alert: bool = False):
@@ -2779,7 +2915,7 @@ async def is_user_subscribed(
 ) -> bool:
     if is_admin(user_id):
         return True
-    if not REQUIRED_CHANNEL:
+    if not is_subscription_required():
         return True
     cached_ts = SUBSCRIPTION_CACHE.get(user_id, 0.0)
     if not force and now_ts() - cached_ts < SUBSCRIPTION_TTL:
@@ -2816,6 +2952,11 @@ def kb_subscribe() -> InlineKeyboardMarkup:
 
 
 async def ensure_subscribed(bot: Bot, chat_id: int, user) -> bool:
+    if is_maintenance_mode() and not is_admin(user.id):
+        await bot.send_message(chat_id, "⛔ Бот временно на технических работах. Попробуйте позже.")
+        return False
+    if not is_subscription_required():
+        return True
     if await is_user_subscribed(bot, user.id):
         return True
     kb = kb_subscribe()
@@ -2825,6 +2966,18 @@ async def ensure_subscribed(bot: Bot, chat_id: int, user) -> bool:
 
 
 async def ensure_subscribed_for_call(call: CallbackQuery, bot: Bot) -> bool:
+    if is_maintenance_mode() and not is_admin(call.from_user.id):
+        await safe_answer(call)
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "⛔ Бот временно на технических работах. Попробуйте позже.",
+            kb_menu(),
+        )
+        return False
+    if not is_subscription_required():
+        return True
     if await is_user_subscribed(bot, call.from_user.id):
         return True
     await safe_answer(call)
@@ -2890,14 +3043,17 @@ def kb_ai_difficulty() -> InlineKeyboardMarkup:
 
 
 def kb_menu() -> InlineKeyboardMarkup:
-    items = [
-        ("\U0001f3b2 Открытая игра", CB.MENU_OPEN),
-        ("\U0001f512 Закрытая игра", CB.MENU_CLOSED),
-        ("\U0001f511 Войти по коду", CB.MENU_JOIN),
-        ("\U0001f916 Игра против ИИ", CB.MENU_AI),
-        ("\U0001f4b0 Игра на ставки", CB.MENU_BETTING),
-        ("\U0001f4d6 Правила", CB.MENU_HELP),
-    ]
+    items: List[Tuple[str, str]] = []
+    if is_open_enabled():
+        items.append(("\U0001f3b2 Открытая игра", CB.MENU_OPEN))
+    if is_closed_enabled():
+        items.append(("\U0001f512 Закрытая игра", CB.MENU_CLOSED))
+        items.append(("\U0001f511 Войти по коду", CB.MENU_JOIN))
+    if is_ai_enabled():
+        items.append(("\U0001f916 Игра против ИИ", CB.MENU_AI))
+    if is_betting_enabled():
+        items.append(("\U0001f4b0 Игра на ставки", CB.MENU_BETTING))
+    items.append(("\U0001f4d6 Правила", CB.MENU_HELP))
     style_setting = get_menu_button_style()
     style = None if style_setting == "off" else style_setting
     def _btn(text: str, cb: Optional[str] = None, url: Optional[str] = None) -> InlineKeyboardButton:
@@ -2912,7 +3068,7 @@ def kb_menu() -> InlineKeyboardMarkup:
     for text, cb in items:
         rows.append([_btn(text, cb=cb)])
     news_url = _news_url()
-    if news_url:
+    if news_url and is_news_enabled():
         rows.append([_btn("\U0001f4f0 Новости", url=news_url)])
     rows.append([_btn("\U0001f464 Профиль", cb=CB.MENU_PROFILE)])
     rows.append([_btn("\U0001f198 Поддержка", cb=CB.MENU_ADMIN_MSG)])
@@ -3111,16 +3267,70 @@ def kb_profile(show_photos: bool, allow_broadcast: bool) -> InlineKeyboardMarkup
     )
 
 def kb_admin_settings() -> InlineKeyboardMarkup:
-    msg_state = "Вкл" if is_admin_msg_enabled() else "Выкл"
-    bet_state = "Вкл" if is_betting_enabled() else "Выкл"
     menu_style = get_menu_button_style()
     menu_label = menu_button_style_label(menu_style)
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"Сообщения админу: {msg_state}", callback_data=CB.ADMIN_TOGGLE_MSG)],
-            [InlineKeyboardButton(text=f"Ставки: {bet_state}", callback_data=CB.ADMIN_TOGGLE_BETTING)],
+            [InlineKeyboardButton(text="Доступ и безопасность", callback_data=CB.ADMIN_SETTINGS_ACCESS)],
+            [InlineKeyboardButton(text="Режимы игр", callback_data=CB.ADMIN_SETTINGS_MODES)],
+            [InlineKeyboardButton(text="Уведомления", callback_data=CB.ADMIN_SETTINGS_NOTIFY)],
+            [InlineKeyboardButton(text="Профиль по умолчанию", callback_data=CB.ADMIN_SETTINGS_DEFAULTS)],
             [InlineKeyboardButton(text=f"Цвет меню: {menu_label}", callback_data=CB.ADMIN_MENU_STYLE)],
             [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_REFRESH)],
+        ]
+    )
+
+
+def kb_admin_settings_access() -> InlineKeyboardMarkup:
+    maint_state = "Вкл" if is_maintenance_mode() else "Выкл"
+    sub_state = "Вкл" if is_subscription_required() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Тех. работы: {maint_state}", callback_data=CB.ADMIN_TOGGLE_MAINT)],
+            [InlineKeyboardButton(text=f"Проверка подписки: {sub_state}", callback_data=CB.ADMIN_TOGGLE_REQUIRE_SUB)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
+        ]
+    )
+
+
+def kb_admin_settings_modes() -> InlineKeyboardMarkup:
+    open_state = "Вкл" if is_open_enabled() else "Выкл"
+    closed_state = "Вкл" if is_closed_enabled() else "Выкл"
+    ai_state = "Вкл" if is_ai_enabled() else "Выкл"
+    bet_state = "Вкл" if is_betting_enabled() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Открытая игра: {open_state}", callback_data=CB.ADMIN_TOGGLE_OPEN)],
+            [InlineKeyboardButton(text=f"Закрытая игра: {closed_state}", callback_data=CB.ADMIN_TOGGLE_CLOSED)],
+            [InlineKeyboardButton(text=f"ИИ режим: {ai_state}", callback_data=CB.ADMIN_TOGGLE_AI)],
+            [InlineKeyboardButton(text=f"Ставки: {bet_state}", callback_data=CB.ADMIN_TOGGLE_BETTING)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
+        ]
+    )
+
+
+def kb_admin_settings_notify() -> InlineKeyboardMarkup:
+    admin_msg = "Вкл" if is_admin_msg_enabled() else "Выкл"
+    broadcast_state = "Вкл" if is_broadcasts_enabled() else "Выкл"
+    news_state = "Вкл" if is_news_enabled() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Сообщения админу: {admin_msg}", callback_data=CB.ADMIN_TOGGLE_MSG)],
+            [InlineKeyboardButton(text=f"Рассылки: {broadcast_state}", callback_data=CB.ADMIN_TOGGLE_BROADCASTS)],
+            [InlineKeyboardButton(text=f"Кнопка «Новости»: {news_state}", callback_data=CB.ADMIN_TOGGLE_NEWS)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
+        ]
+    )
+
+
+def kb_admin_settings_defaults() -> InlineKeyboardMarkup:
+    photo_state = "Вкл" if default_show_card_photos() else "Выкл"
+    notify_state = "Вкл" if default_allow_broadcast() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Фото карт по умолчанию: {photo_state}", callback_data=CB.ADMIN_TOGGLE_DEFAULT_PHOTO)],
+            [InlineKeyboardButton(text=f"Уведомления по умолчанию: {notify_state}", callback_data=CB.ADMIN_TOGGLE_DEFAULT_NOTIFY)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
         ]
     )
 
@@ -3148,6 +3358,11 @@ def render_admin_text() -> str:
     db_status = "✅" if db_ok else "❌"
     db_ping_txt = f"{db_ping_ms:.0f} ms" if db_ping_ms is not None else "—"
     total_starts = db.count_unique_users("start", 0)
+    maint = "Вкл" if is_maintenance_mode() else "Выкл"
+    sub_req = "Вкл" if is_subscription_required() else "Выкл"
+    open_state = "Вкл" if is_open_enabled() else "Выкл"
+    closed_state = "Вкл" if is_closed_enabled() else "Выкл"
+    ai_state = "Вкл" if is_ai_enabled() else "Выкл"
     return (
         f"<b>Админ панель</b>\n\n"
         f"💰 Доход (комиссия): ${stats['total_commission']:.2f}\n"
@@ -3158,6 +3373,9 @@ def render_admin_text() -> str:
         f"💵 Балансы: ${stats['total_user_balance']:.2f}\n"
         f"🆘 Открытых тикетов: {stats['open_tickets']}\n"
         f"📢 Уведомлений активно: {stats['active_broadcasts']}\n"
+        f"🛠️ Тех. работы: {maint}\n"
+        f"🔐 Подписка обязательна: {sub_req}\n"
+        f"🎛️ Режимы: открытая {open_state}, закрытая {closed_state}, ИИ {ai_state}\n"
         f"🗄️ DB: {db_status} • {db_ping_txt}\n"
     )
 
@@ -4017,6 +4235,15 @@ async def cb_menu_open(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -4029,6 +4256,15 @@ async def cb_menu_open(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_OPEN_CREATE)
 async def cb_open_create(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -4041,6 +4277,15 @@ async def cb_open_create(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_OPEN_FRIEND)
 async def cb_open_friend(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -4053,6 +4298,15 @@ async def cb_open_friend(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_OPEN_AUTO)
 async def cb_open_auto(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
         await safe_edit_text(
@@ -4118,6 +4372,15 @@ async def cb_open_auto(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.MENU_OPEN_LIST)
 async def cb_open_list(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     now = now_ts()
     lst = [
         lb for lb in lobbies.lobbies.values()
@@ -4148,6 +4411,15 @@ async def cb_open_list(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.OPEN_CREATE))
 async def cb_open_create_max(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     try:
         max_players = int(call.data[len(CB.OPEN_CREATE):])
     except ValueError:
@@ -4181,6 +4453,15 @@ async def cb_open_create_max(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.OPEN_FRIEND))
 async def cb_open_friend_max(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     try:
         max_players = int(call.data[len(CB.OPEN_FRIEND):])
     except ValueError:
@@ -4216,6 +4497,15 @@ async def cb_open_friend_max(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.OPEN_JOIN))
 async def cb_open_join(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_open_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Открытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
         await safe_edit_text(
@@ -4267,6 +4557,15 @@ async def cb_menu_closed(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
+    if not is_closed_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Закрытая игра временно отключена.",
+            kb_menu(),
+        )
+        return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
         await call.message.edit_text(render_lobby_text(existing), reply_markup=kb_lobby(existing, call.from_user.id), parse_mode=ParseMode.HTML)
@@ -4284,6 +4583,15 @@ async def cb_menu_join(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
+    if not is_closed_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Вход по коду временно отключён.",
+            kb_menu(),
+        )
+        return
     awaiting_code.add(call.from_user.id)
     await safe_edit_text(
         bot,
@@ -4299,12 +4607,30 @@ async def cb_menu_ai(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
+    if not is_ai_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Игра против ИИ временно отключена.",
+            kb_menu(),
+        )
+        return
     await call.message.edit_text("🤖 Выбери сложность ИИ:", reply_markup=kb_ai_difficulty())
 
 
 @router.callback_query(F.data.startswith(CB.AI_DIFF))
 async def cb_ai_diff(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
+    if not is_ai_enabled():
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Игра против ИИ временно отключена.",
+            kb_menu(),
+        )
+        return
     diff_s = call.data[len(CB.AI_DIFF):]
     diff = AIDifficulty(diff_s)
     model = {
@@ -4690,6 +5016,62 @@ async def cb_admin_settings(call: CallbackQuery, bot: Bot):
     )
 
 
+@router.callback_query(F.data == CB.ADMIN_SETTINGS_ACCESS)
+async def cb_admin_settings_access(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Доступ и безопасность:",
+        kb_admin_settings_access(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_SETTINGS_MODES)
+async def cb_admin_settings_modes(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Режимы игр:",
+        kb_admin_settings_modes(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_SETTINGS_NOTIFY)
+async def cb_admin_settings_notify(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Уведомления:",
+        kb_admin_settings_notify(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_SETTINGS_DEFAULTS)
+async def cb_admin_settings_defaults(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Профиль по умолчанию:",
+        kb_admin_settings_defaults(),
+    )
+
+
 @router.callback_query(F.data == CB.ADMIN_NOTIFY)
 async def cb_admin_notify(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
@@ -4940,8 +5322,8 @@ async def cb_admin_toggle_msg(call: CallbackQuery, bot: Bot):
         bot,
         call.message.chat.id,
         call.message.message_id,
-        "Настройки:",
-        kb_admin_settings(),
+        "Уведомления:",
+        kb_admin_settings_notify(),
     )
 
 
@@ -4955,8 +5337,8 @@ async def cb_admin_toggle_betting(call: CallbackQuery, bot: Bot):
         bot,
         call.message.chat.id,
         call.message.message_id,
-        "Настройки:",
-        kb_admin_settings(),
+        "Режимы игр:",
+        kb_admin_settings_modes(),
     )
 
 
@@ -4989,6 +5371,141 @@ async def cb_admin_menu_style_set(call: CallbackQuery, bot: Bot):
         call.message.message_id,
         "Цвет кнопок главного меню:",
         kb_admin_menu_style(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_MAINT)
+async def cb_admin_toggle_maint(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("maintenance_mode", not is_maintenance_mode())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Доступ и безопасность:",
+        kb_admin_settings_access(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_REQUIRE_SUB)
+async def cb_admin_toggle_require_sub(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("require_subscription", not is_subscription_required())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Доступ и безопасность:",
+        kb_admin_settings_access(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_OPEN)
+async def cb_admin_toggle_open(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("open_enabled", not is_open_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Режимы игр:",
+        kb_admin_settings_modes(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_CLOSED)
+async def cb_admin_toggle_closed(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("closed_enabled", not is_closed_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Режимы игр:",
+        kb_admin_settings_modes(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_AI)
+async def cb_admin_toggle_ai(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("ai_enabled", not is_ai_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Режимы игр:",
+        kb_admin_settings_modes(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_NEWS)
+async def cb_admin_toggle_news(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("news_button_enabled", not is_news_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Уведомления:",
+        kb_admin_settings_notify(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_BROADCASTS)
+async def cb_admin_toggle_broadcasts(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("broadcasts_enabled", not is_broadcasts_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Уведомления:",
+        kb_admin_settings_notify(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_DEFAULT_PHOTO)
+async def cb_admin_toggle_default_photo(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("default_show_card_photos", not default_show_card_photos())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Профиль по умолчанию:",
+        kb_admin_settings_defaults(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_DEFAULT_NOTIFY)
+async def cb_admin_toggle_default_notify(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("default_allow_broadcast", not default_allow_broadcast())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Профиль по умолчанию:",
+        kb_admin_settings_defaults(),
     )
 
 
@@ -5456,12 +5973,15 @@ async def msg_any(message: Message, bot: Bot):
     text = (message.text or "").strip()
     if text.startswith("/"):
         return
-    if REQUIRED_CHANNEL and not is_admin(uid):
+    if is_subscription_required() and not is_admin(uid):
         if not await is_user_subscribed(bot, uid):
             await ensure_subscribed(bot, message.chat.id, message.from_user)
             return
     if uid in awaiting_code:
         awaiting_code.discard(uid)
+        if not is_closed_enabled():
+            await message.answer("Вход по коду временно отключён.")
+            return
         code = text.upper()
         player = build_player(message.from_user)
         lobby = lobbies.join_closed(player, code)
@@ -5729,6 +6249,8 @@ async def check_betting_afk(bot: Bot):
 
 
 async def process_broadcasts(bot: Bot):
+    if not is_broadcasts_enabled():
+        return
     now = now_ts()
     due = db.activate_due_broadcasts(now)
     if due:
@@ -5969,16 +6491,25 @@ def render_main_menu_text(user=None, compact: bool = False) -> str:
         lines.append(f" {accent} ")
     lines.append(" ")
     lines.append("Режимы")
-    lines.append("• Открытая игра — быстрый поиск соперников")
-    lines.append("• Закрытая игра — матч по коду")
-    lines.append("• Игра против ИИ — тренировка в одиночку")
-    lines.append("• Игра на ставки — играй на деньги")
+    modes_lines = []
+    if is_open_enabled():
+        modes_lines.append("• Открытая игра — быстрый поиск соперников")
+    if is_closed_enabled():
+        modes_lines.append("• Закрытая игра — матч по коду")
+    if is_ai_enabled():
+        modes_lines.append("• Игра против ИИ — тренировка в одиночку")
+    if is_betting_enabled():
+        modes_lines.append("• Игра на ставки — играй на деньги")
+    if modes_lines:
+        lines.extend(modes_lines)
+    else:
+        lines.append("• Режимы временно недоступны")
     lines.append(" ")
     lines.append("Нужна помощь? Загляни в «Правила».")
-    show_notice = True
+    show_notice = is_broadcasts_enabled()
     if user:
         settings = get_cached_user_settings(user.id)
-        show_notice = bool(settings.get("allow_broadcast", 1))
+        show_notice = show_notice and bool(settings.get("allow_broadcast", 1))
     notice_text_raw = get_cached_notice_text() if show_notice else None
     if notice_text_raw:
         notice_text = html.escape(notice_text_raw)
