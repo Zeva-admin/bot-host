@@ -97,6 +97,7 @@ COLOR_NAME_RU = {
 # =============================================================================
 # УТИЛИТЫ
 # =============================================================================
+MENU_BUTTON_STYLES = ("primary", "success", "danger")
 def now_ts() -> float:
     return time.time()
 
@@ -2817,19 +2818,26 @@ def kb_ai_difficulty() -> InlineKeyboardMarkup:
 
 
 def kb_menu() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="\U0001f3b2 Открытая игра", callback_data=CB.MENU_OPEN)],
-        [InlineKeyboardButton(text="\U0001f512 Закрытая игра", callback_data=CB.MENU_CLOSED)],
-        [InlineKeyboardButton(text="\U0001f511 Войти по коду", callback_data=CB.MENU_JOIN)],
-        [InlineKeyboardButton(text="\U0001f916 Игра против ИИ", callback_data=CB.MENU_AI)],
-        [InlineKeyboardButton(text="\U0001f4b0 Игра на ставки", callback_data=CB.MENU_BETTING)],
-        [InlineKeyboardButton(text="\U0001f4d6 Правила", callback_data=CB.MENU_HELP)],
+    items = [
+        ("\U0001f3b2 Открытая игра", CB.MENU_OPEN),
+        ("\U0001f512 Закрытая игра", CB.MENU_CLOSED),
+        ("\U0001f511 Войти по коду", CB.MENU_JOIN),
+        ("\U0001f916 Игра против ИИ", CB.MENU_AI),
+        ("\U0001f4b0 Игра на ставки", CB.MENU_BETTING),
+        ("\U0001f4d6 Правила", CB.MENU_HELP),
     ]
+    rows = []
+    for i, (text, cb) in enumerate(items):
+        style = MENU_BUTTON_STYLES[i % len(MENU_BUTTON_STYLES)]
+        rows.append([InlineKeyboardButton(text=text, callback_data=cb, style=style)])
     news_url = _news_url()
     if news_url:
-        rows.append([InlineKeyboardButton(text="\U0001f4f0 Новости", url=news_url)])
-    rows.append([InlineKeyboardButton(text="\U0001f464 Профиль", callback_data=CB.MENU_PROFILE)])
-    rows.append([InlineKeyboardButton(text="\U0001f198 Поддержка", callback_data=CB.MENU_ADMIN_MSG)])
+        style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
+        rows.append([InlineKeyboardButton(text="\U0001f4f0 Новости", url=news_url, style=style)])
+    style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
+    rows.append([InlineKeyboardButton(text="\U0001f464 Профиль", callback_data=CB.MENU_PROFILE, style=style)])
+    style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
+    rows.append([InlineKeyboardButton(text="\U0001f198 Поддержка", callback_data=CB.MENU_ADMIN_MSG, style=style)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
