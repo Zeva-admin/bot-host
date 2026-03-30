@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8788323258:AAESyyBf_-S2MHuklb0bTJrgls_am0Wazm4"
+TOKEN = "8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
 GROQ_API_KEY = "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"
 CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
@@ -97,7 +97,13 @@ COLOR_NAME_RU = {
 # =============================================================================
 # УТИЛИТЫ
 # =============================================================================
-MENU_BUTTON_STYLES = ("primary", "success", "danger")
+MENU_BUTTON_STYLE_OPTIONS = ("primary", "success", "danger", "off")
+MENU_BUTTON_STYLE_LABELS = {
+    "primary": "Синий",
+    "success": "Зелёный",
+    "danger": "Красный",
+    "off": "Выкл",
+}
 def now_ts() -> float:
     return time.time()
 
@@ -475,6 +481,11 @@ class Database:
                 "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
                 ("betting_enabled", "1"),
             )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("menu_button_style", "primary"),
+            )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
@@ -483,6 +494,10 @@ class Database:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
                 ("betting_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("menu_button_style", "primary"),
             )
         
         conn.commit()
@@ -2627,6 +2642,8 @@ class CB:
     ADMIN_SYSTEM = "a:system"
     ADMIN_TOGGLE_MSG = "a:toggle_msg"
     ADMIN_TOGGLE_BETTING = "a:toggle_betting"
+    ADMIN_MENU_STYLE = "a:menu_style"
+    ADMIN_MENU_STYLE_SET = "a:menu_style_set:"
     ADMIN_CLEANUP = "a:cleanup"
     ADMIN_CLEANUP_FULL = "a:cleanup:full"
     ADMIN_CLEANUP_FULL_CONFIRM = "a:cleanup:full:confirm"
@@ -2661,6 +2678,24 @@ def is_admin_msg_enabled() -> bool:
 
 def is_betting_enabled() -> bool:
     return db.get_bool_setting("betting_enabled")
+
+
+def get_menu_button_style() -> str:
+    style = db.get_setting("menu_button_style", "primary").strip().lower()
+    return style if style in MENU_BUTTON_STYLE_OPTIONS else "primary"
+
+
+def next_menu_button_style(current: str) -> str:
+    order = MENU_BUTTON_STYLE_OPTIONS
+    try:
+        idx = order.index(current)
+    except ValueError:
+        idx = 0
+    return order[(idx + 1) % len(order)]
+
+
+def menu_button_style_label(style: str) -> str:
+    return MENU_BUTTON_STYLE_LABELS.get(style, "Синий")
 
 
 async def safe_answer(call: CallbackQuery, text: str = None, show_alert: bool = False):
@@ -2734,24 +2769,40 @@ def _channel_candidates() -> List[object]:
     return candidates
 
 
-async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
+async def is_user_subscribed(
+    bot: Bot,
+    user_id: int,
+    force: bool = False,
+    retries: int = 0,
+    delay: float = 1.0,
+    allow_on_error: bool = False,
+) -> bool:
     if is_admin(user_id):
         return True
     if not REQUIRED_CHANNEL:
         return True
     cached_ts = SUBSCRIPTION_CACHE.get(user_id, 0.0)
-    if now_ts() - cached_ts < SUBSCRIPTION_TTL:
+    if not force and now_ts() - cached_ts < SUBSCRIPTION_TTL:
         return True
-    for chat_id in _channel_candidates():
-        try:
-            member = await bot.get_chat_member(chat_id, user_id)
-            status = getattr(member, "status", "")
-            is_member = getattr(member, "is_member", False)
-            if status in ("creator", "administrator", "member", "restricted") or is_member:
-                SUBSCRIPTION_CACHE[user_id] = now_ts()
-                return True
-        except Exception:
-            continue
+    had_error = False
+    attempts = max(0, int(retries)) + 1
+    for attempt in range(attempts):
+        for chat_id in _channel_candidates():
+            try:
+                member = await bot.get_chat_member(chat_id, user_id)
+                status = getattr(member, "status", "")
+                is_member = getattr(member, "is_member", False)
+                if status in ("creator", "administrator", "member", "restricted") or is_member:
+                    SUBSCRIPTION_CACHE[user_id] = now_ts()
+                    return True
+            except Exception:
+                had_error = True
+                continue
+        if attempt < attempts - 1:
+            await asyncio.sleep(max(0.2, float(delay)))
+    if allow_on_error and had_error:
+        SUBSCRIPTION_CACHE[user_id] = now_ts()
+        return True
     return False
 
 
@@ -2847,18 +2898,24 @@ def kb_menu() -> InlineKeyboardMarkup:
         ("\U0001f4b0 Игра на ставки", CB.MENU_BETTING),
         ("\U0001f4d6 Правила", CB.MENU_HELP),
     ]
+    style_setting = get_menu_button_style()
+    style = None if style_setting == "off" else style_setting
+    def _btn(text: str, cb: Optional[str] = None, url: Optional[str] = None) -> InlineKeyboardButton:
+        if url:
+            if style:
+                return InlineKeyboardButton(text=text, url=url, style=style)
+            return InlineKeyboardButton(text=text, url=url)
+        if style:
+            return InlineKeyboardButton(text=text, callback_data=cb, style=style)
+        return InlineKeyboardButton(text=text, callback_data=cb)
     rows = []
-    for i, (text, cb) in enumerate(items):
-        style = MENU_BUTTON_STYLES[i % len(MENU_BUTTON_STYLES)]
-        rows.append([InlineKeyboardButton(text=text, callback_data=cb, style=style)])
+    for text, cb in items:
+        rows.append([_btn(text, cb=cb)])
     news_url = _news_url()
     if news_url:
-        style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
-        rows.append([InlineKeyboardButton(text="\U0001f4f0 Новости", url=news_url, style=style)])
-    style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
-    rows.append([InlineKeyboardButton(text="\U0001f464 Профиль", callback_data=CB.MENU_PROFILE, style=style)])
-    style = MENU_BUTTON_STYLES[len(rows) % len(MENU_BUTTON_STYLES)]
-    rows.append([InlineKeyboardButton(text="\U0001f198 Поддержка", callback_data=CB.MENU_ADMIN_MSG, style=style)])
+        rows.append([_btn("\U0001f4f0 Новости", url=news_url)])
+    rows.append([_btn("\U0001f464 Профиль", cb=CB.MENU_PROFILE)])
+    rows.append([_btn("\U0001f198 Поддержка", cb=CB.MENU_ADMIN_MSG)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3056,17 +3113,37 @@ def kb_profile(show_photos: bool, allow_broadcast: bool) -> InlineKeyboardMarkup
 def kb_admin_settings() -> InlineKeyboardMarkup:
     msg_state = "Вкл" if is_admin_msg_enabled() else "Выкл"
     bet_state = "Вкл" if is_betting_enabled() else "Выкл"
+    menu_style = get_menu_button_style()
+    menu_label = menu_button_style_label(menu_style)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Сообщения админу: {msg_state}", callback_data=CB.ADMIN_TOGGLE_MSG)],
             [InlineKeyboardButton(text=f"Ставки: {bet_state}", callback_data=CB.ADMIN_TOGGLE_BETTING)],
+            [InlineKeyboardButton(text=f"Цвет меню: {menu_label}", callback_data=CB.ADMIN_MENU_STYLE)],
             [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_REFRESH)],
         ]
     )
 
 
+def kb_admin_menu_style() -> InlineKeyboardMarkup:
+    current = get_menu_button_style()
+    rows = []
+    for style in MENU_BUTTON_STYLE_OPTIONS:
+        label = MENU_BUTTON_STYLE_LABELS.get(style, style)
+        mark = " ✅" if style == current else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{label}{mark}",
+                callback_data=f"{CB.ADMIN_MENU_STYLE_SET}{style}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def render_admin_text() -> str:
     stats = db.get_admin_stats()
+    
     db_ok, db_ping_ms, _ = db.ping_ms()
     db_status = "✅" if db_ok else "❌"
     db_ping_txt = f"{db_ping_ms:.0f} ms" if db_ping_ms is not None else "—"
@@ -3861,11 +3938,11 @@ async def cb_back_menu(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == CB.CHECK_SUB)
 async def cb_check_sub(call: CallbackQuery, bot: Bot):
-    if await is_user_subscribed(bot, call.from_user.id):
+    if await is_user_subscribed(bot, call.from_user.id, force=True, retries=2, delay=1.0, allow_on_error=True):
         await safe_answer(call, "Подписка подтверждена!")
         await show_menu(bot, call.message.chat.id, call.from_user, call.message)
         return
-    await safe_answer(call, "Подписка не найдена.", show_alert=True)
+    await safe_answer(call, "Подписка не найдена. Если вы только что подписались, подождите 10–15 секунд и нажмите ещё раз.", show_alert=True)
 
 
 @router.callback_query(F.data == CB.MENU_HELP)
@@ -4880,6 +4957,38 @@ async def cb_admin_toggle_betting(call: CallbackQuery, bot: Bot):
         call.message.message_id,
         "Настройки:",
         kb_admin_settings(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_MENU_STYLE)
+async def cb_admin_menu_style(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Цвет кнопок главного меню:",
+        kb_admin_menu_style(),
+    )
+
+
+@router.callback_query(F.data.startswith(CB.ADMIN_MENU_STYLE_SET))
+async def cb_admin_menu_style_set(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    style = call.data[len(CB.ADMIN_MENU_STYLE_SET):].strip().lower()
+    if style not in MENU_BUTTON_STYLE_OPTIONS:
+        style = "primary"
+    db.set_setting("menu_button_style", style)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Цвет кнопок главного меню:",
+        kb_admin_menu_style(),
     )
 
 
