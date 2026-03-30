@@ -106,7 +106,7 @@ SUBSCRIPTION_CACHE: Dict[int, float] = {}
 SUBSCRIPTION_TTL = 300.0
 NOTICE_CACHE: Dict[str, Optional[object]] = {"ts": 0.0, "text": None}
 USER_SETTINGS_CACHE: Dict[int, Tuple[float, dict]] = {}
-USER_SETTINGS_TTL = 60.0
+USER_SETTINGS_TTL = 300.0
 SHUTDOWN_EVENT = asyncio.Event()
 
 def gen_code(k: int = 6) -> str:
@@ -1627,6 +1627,8 @@ class Player:
     ui_message_id: Optional[int] = None
     is_ai: bool = False
     has_paid: bool = False
+    show_card_photos: bool = True
+    allow_broadcast: bool = True
 
     def sort_hand(self, trump: Suit) -> None:
         suit_order = {
@@ -2788,7 +2790,7 @@ async def ensure_subscribed_for_call(call: CallbackQuery, bot: Bot) -> bool:
 
 def get_cached_notice_text() -> Optional[str]:
     now = now_ts()
-    if now - float(NOTICE_CACHE.get("ts") or 0) < 10:
+    if now - float(NOTICE_CACHE.get("ts") or 0) < 60:
         return NOTICE_CACHE.get("text")
     try:
         active_notice = db.get_active_broadcast(now)
@@ -2813,6 +2815,16 @@ def get_cached_user_settings(user_id: int) -> dict:
 
 def update_cached_user_settings(user_id: int, data: dict) -> None:
     USER_SETTINGS_CACHE[user_id] = (now_ts(), data)
+
+
+def build_player(user) -> Player:
+    settings = get_cached_user_settings(user.id)
+    return Player(
+        user_id=user.id,
+        name=human_name(user),
+        show_card_photos=bool(settings.get("show_card_photos", 1)),
+        allow_broadcast=bool(settings.get("allow_broadcast", 1)),
+    )
 
 
 def kb_ai_difficulty() -> InlineKeyboardMarkup:
@@ -3887,6 +3899,11 @@ async def cb_profile_toggle_photo(call: CallbackQuery, bot: Bot):
     db.set_user_setting(call.from_user.id, "show_card_photos", new_val)
     settings = db.get_user_settings(call.from_user.id)
     update_cached_user_settings(call.from_user.id, settings)
+    lobby = lobbies.get_lobby_by_player(call.from_user.id)
+    if lobby:
+        pl = lobby.get_player(call.from_user.id)
+        if pl:
+            pl.show_card_photos = bool(settings.get("show_card_photos", 1))
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3904,6 +3921,11 @@ async def cb_profile_toggle_notify(call: CallbackQuery, bot: Bot):
     db.set_user_setting(call.from_user.id, "allow_broadcast", new_val)
     settings = db.get_user_settings(call.from_user.id)
     update_cached_user_settings(call.from_user.id, settings)
+    lobby = lobbies.get_lobby_by_player(call.from_user.id)
+    if lobby:
+        pl = lobby.get_player(call.from_user.id)
+        if pl:
+            pl.allow_broadcast = bool(settings.get("allow_broadcast", 1))
     await safe_edit_text(
         bot,
         call.message.chat.id,
@@ -3993,7 +4015,7 @@ async def cb_open_auto(call: CallbackQuery, bot: Bot):
         ]
         if candidates:
             lobby = random.choice(candidates)
-            player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+            player = build_player(call.from_user)
             if lobbies._try_join(lobby, player):
                 player.ui_chat_id = call.message.chat.id
                 player.ui_message_id = call.message.message_id
@@ -4065,7 +4087,7 @@ async def cb_open_create_max(call: CallbackQuery, bot: Bot):
             kb_lobby(existing, call.from_user.id),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.open, max_players=max_players)
     player.ui_chat_id = call.message.chat.id
     player.ui_message_id = call.message.message_id
@@ -4098,7 +4120,7 @@ async def cb_open_friend_max(call: CallbackQuery, bot: Bot):
             kb_lobby(existing, call.from_user.id),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.closed, max_players=max_players)
     lobby.code = lobby.code or gen_code(6)
     lobby.is_listed = False
@@ -4141,7 +4163,7 @@ async def cb_open_join(call: CallbackQuery, bot: Bot):
             kb_open_menu(),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     if not lobbies._try_join(lobby, player):
         await safe_edit_text(
             bot,
@@ -4172,7 +4194,7 @@ async def cb_menu_closed(call: CallbackQuery, bot: Bot):
     if existing:
         await call.message.edit_text(render_lobby_text(existing), reply_markup=kb_lobby(existing, call.from_user.id), parse_mode=ParseMode.HTML)
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.closed)
     lobby.code = lobby.code or gen_code(6)
     player.ui_chat_id = call.message.chat.id
@@ -4213,7 +4235,7 @@ async def cb_ai_diff(call: CallbackQuery, bot: Bot):
         AIDifficulty.normal: AI_MODEL_NORMAL,
         AIDifficulty.hard: AI_MODEL_HARD,
     }[diff]
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.ai)
     lobby.ai_difficulty = diff
     lobby.ai_model = model
@@ -4302,7 +4324,7 @@ async def cb_betting_create(call: CallbackQuery, bot: Bot):
             kb_lobby(existing, call.from_user.id),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.betting, max_players=2)
     lobby.stake_amount = amount
     lobby.code = gen_code(6)
@@ -4335,7 +4357,7 @@ async def cb_betting_friend(call: CallbackQuery, bot: Bot):
             kb_lobby(existing, call.from_user.id),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     lobby = lobbies.create_lobby(player, LobbyMode.betting, max_players=2)
     lobby.stake_amount = amount
     lobby.code = gen_code(6)
@@ -4399,7 +4421,7 @@ async def cb_betting_auto(call: CallbackQuery, bot: Bot):
         ]
         if candidates:
             lobby = random.choice(candidates)
-            player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+            player = build_player(call.from_user)
             if lobbies._try_join(lobby, player):
                 player.ui_chat_id = call.message.chat.id
                 player.ui_message_id = call.message.message_id
@@ -4484,7 +4506,7 @@ async def cb_betting_join(call: CallbackQuery, bot: Bot):
             kb_menu(),
         )
         return
-    player = Player(user_id=call.from_user.id, name=human_name(call.from_user))
+    player = build_player(call.from_user)
     if not lobbies._try_join(lobby, player):
         await safe_edit_text(
             bot,
@@ -5332,7 +5354,7 @@ async def msg_any(message: Message, bot: Bot):
     if uid in awaiting_code:
         awaiting_code.discard(uid)
         code = text.upper()
-        player = Player(user_id=uid, name=human_name(message.from_user))
+        player = build_player(message.from_user)
         lobby = lobbies.join_closed(player, code)
         if not lobby:
             await message.answer("Код не найден или лобби заполнено.")
@@ -5484,8 +5506,7 @@ async def broadcast_table_card_photos(bot: Bot, lobby: Lobby, gs: GameState,
     for pl in lobby.players:
         if pl.is_ai:
             continue
-        settings = get_cached_user_settings(pl.user_id)
-        if not settings.get("show_card_photos", 1):
+        if not pl.show_card_photos:
             continue
         if pl.user_id not in gs.table_photo_message_ids:
             gs.table_photo_message_ids[pl.user_id] = []
