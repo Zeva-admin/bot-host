@@ -166,6 +166,9 @@ class Database:
         self.db_path = STATS_DB_PATH
         self.db_url = DATABASE_URL
         self.db_kind = "postgres" if self.db_url else "sqlite"
+        self._kv_cache: Dict[str, str] = {}
+        self._kv_cache_ts = 0.0
+        self._kv_cache_ttl = 30.0
         self._init_db()
         self._initialized = True
         log_message("База данных инициализирована")
@@ -543,11 +546,15 @@ class Database:
     
     def get_setting(self, key: str, default: str) -> str:
         try:
-            with self._get_connection() as conn:
-                cur = conn.cursor()
-                self._exec(cur, "SELECT value FROM kv_settings WHERE key = ?", (key,))
-                row = cur.fetchone()
-                return row[0] if row else default
+            now = now_ts()
+            if (now - self._kv_cache_ts) > self._kv_cache_ttl or key not in self._kv_cache:
+                with self._get_connection() as conn:
+                    cur = conn.cursor()
+                    self._exec(cur, "SELECT key, value FROM kv_settings")
+                    rows = cur.fetchall() or []
+                    self._kv_cache = {str(r[0]): str(r[1]) for r in rows if r and r[0]}
+                    self._kv_cache_ts = now
+            return self._kv_cache.get(key, default)
         except Exception:
             return default
     
@@ -562,6 +569,8 @@ class Database:
                     (key, value),
                 )
                 conn.commit()
+            self._kv_cache[key] = value
+            self._kv_cache_ts = now_ts()
         except Exception:
             pass
     
@@ -5475,7 +5484,7 @@ async def broadcast_table_card_photos(bot: Bot, lobby: Lobby, gs: GameState,
     for pl in lobby.players:
         if pl.is_ai:
             continue
-        settings = db.get_user_settings(pl.user_id)
+        settings = get_cached_user_settings(pl.user_id)
         if not settings.get("show_card_photos", 1):
             continue
         if pl.user_id not in gs.table_photo_message_ids:
@@ -5600,7 +5609,7 @@ async def process_broadcasts(bot: Bot):
                 continue
             for uid in user_ids:
                 try:
-                    settings = db.get_user_settings(uid)
+                    settings = get_cached_user_settings(uid)
                     if not settings.get("allow_broadcast", 1):
                         continue
                     await bot.send_message(uid, f"📢 {text}")
@@ -5851,7 +5860,7 @@ def render_main_menu_text(user=None, compact: bool = False) -> str:
 
 def render_profile_text(user) -> str:
     profile = db.get_user_profile(user.id)
-    settings = db.get_user_settings(user.id)
+    settings = get_cached_user_settings(user.id)
     balance = profile.get("balance", 0.0)
     total_won = profile.get("total_won", 0.0)
     total_lost = profile.get("total_lost", 0.0)
