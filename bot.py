@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -104,6 +104,7 @@ MENU_BUTTON_STYLE_LABELS = {
     "danger": "Красный",
     "off": "Выкл",
 }
+SUPPORT_RUB_RATE_DEFAULT = 80.0
 def now_ts() -> float:
     return time.time()
 
@@ -531,6 +532,16 @@ class Database:
                 "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
                 ("default_allow_broadcast", "1"),
             )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("support_donations_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)),
+            )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
@@ -579,6 +590,14 @@ class Database:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
                 ("default_allow_broadcast", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("support_donations_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)),
             )
         
         conn.commit()
@@ -2658,6 +2677,8 @@ awaiting_support_reply: Dict[int, int] = {}
 awaiting_admin_broadcast: Dict[int, dict] = {}
 awaiting_admin_cleanup: Dict[int, dict] = {}
 awaiting_payment: Dict[int, dict] = {}
+awaiting_support_donation: Dict[int, dict] = {}
+awaiting_support_donation_payment: Dict[int, dict] = {}
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY) if Groq else None
 last_say_ts: Dict[int, float] = {}
@@ -2679,6 +2700,7 @@ class CB:
     MENU_BETTING = "m:betting"
     MENU_ADMIN_MSG = "m:admin_msg"
     MENU_PROFILE = "m:profile"
+    MENU_SUPPORT_DONATE = "m:support_donate"
     AI_DIFF = "ai:diff:"
     BETTING_SELECT = "betting:select:"
     BETTING_CREATE = "betting:create:"
@@ -2740,6 +2762,7 @@ class CB:
     ADMIN_TOGGLE_AI = "a:toggle_ai"
     ADMIN_TOGGLE_NEWS = "a:toggle_news"
     ADMIN_TOGGLE_BROADCASTS = "a:toggle_broadcasts"
+    ADMIN_TOGGLE_SUPPORT_DONATIONS = "a:toggle_support_donations"
     ADMIN_TOGGLE_DEFAULT_PHOTO = "a:toggle_def_photo"
     ADMIN_TOGGLE_DEFAULT_NOTIFY = "a:toggle_def_notify"
     ADMIN_CLEANUP = "a:cleanup"
@@ -2753,6 +2776,8 @@ class CB:
     SUPPORT_TYPE = "s:type:"
     SUPPORT_REPLY = "s:reply:"
     SUPPORT_CLOSE = "s:close:"
+    SUPPORT_DONATE_CUR = "s:donate:cur:"
+    SUPPORT_DONATE_CANCEL = "s:donate:cancel"
     PROFILE_TOGGLE_PHOTO = "p:photo"
     PROFILE_TOGGLE_NOTIFY = "p:notify"
     CHECK_SUB = "m:check_sub"
@@ -2824,6 +2849,21 @@ def is_news_enabled() -> bool:
 
 def is_broadcasts_enabled() -> bool:
     return db.get_bool_setting("broadcasts_enabled", True)
+
+
+def is_support_donations_enabled() -> bool:
+    return db.get_bool_setting("support_donations_enabled", True)
+
+
+def get_support_rub_rate() -> float:
+    raw = db.get_setting("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)).strip()
+    try:
+        val = float(raw.replace(",", "."))
+        if val <= 0:
+            raise ValueError
+        return val
+    except Exception:
+        return SUPPORT_RUB_RATE_DEFAULT
 
 
 def default_show_card_photos() -> bool:
@@ -3070,6 +3110,8 @@ def kb_menu() -> InlineKeyboardMarkup:
     news_url = _news_url()
     if news_url and is_news_enabled():
         rows.append([_btn("\U0001f4f0 Новости", url=news_url)])
+    if is_support_donations_enabled() and cryptobot.enabled:
+        rows.append([_btn("\U0001f91d Поддержать бота", cb=CB.MENU_SUPPORT_DONATE)])
     rows.append([_btn("\U0001f464 Профиль", cb=CB.MENU_PROFILE)])
     rows.append([_btn("\U0001f198 Поддержка", cb=CB.MENU_ADMIN_MSG)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3313,11 +3355,13 @@ def kb_admin_settings_notify() -> InlineKeyboardMarkup:
     admin_msg = "Вкл" if is_admin_msg_enabled() else "Выкл"
     broadcast_state = "Вкл" if is_broadcasts_enabled() else "Выкл"
     news_state = "Вкл" if is_news_enabled() else "Выкл"
+    donate_state = "Вкл" if is_support_donations_enabled() else "Выкл"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Сообщения админу: {admin_msg}", callback_data=CB.ADMIN_TOGGLE_MSG)],
             [InlineKeyboardButton(text=f"Рассылки: {broadcast_state}", callback_data=CB.ADMIN_TOGGLE_BROADCASTS)],
             [InlineKeyboardButton(text=f"Кнопка «Новости»: {news_state}", callback_data=CB.ADMIN_TOGGLE_NEWS)],
+            [InlineKeyboardButton(text=f"Поддержка бота: {donate_state}", callback_data=CB.ADMIN_TOGGLE_SUPPORT_DONATIONS)],
             [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
         ]
     )
@@ -3501,6 +3545,24 @@ def kb_admin_msg_cancel() -> InlineKeyboardMarkup:
 def kb_support_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.SUPPORT_CANCEL)]]
+    )
+
+
+def kb_support_donate_currency() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="USD (доллар)", callback_data=f"{CB.SUPPORT_DONATE_CUR}usd"),
+                InlineKeyboardButton(text="RUB (рубли)", callback_data=f"{CB.SUPPORT_DONATE_CUR}rub"),
+            ],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.SUPPORT_DONATE_CANCEL)],
+        ]
+    )
+
+
+def kb_support_donate_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.SUPPORT_DONATE_CANCEL)]]
     )
 
 
@@ -4091,6 +4153,47 @@ async def check_payment_loop(bot: Bot, user_id: int, invoice_id: int, amount: fl
             return
 
 
+async def check_support_donation_payment(
+    bot: Bot,
+    user_id: int,
+    invoice_id: int,
+    amount_usd: float,
+    display_amount: str,
+):
+    start_time = now_ts()
+    while True:
+        await asyncio.sleep(PAYMENT_CHECK_INTERVAL)
+        try:
+            paid, _ = await cryptobot.check_payment(invoice_id)
+        except Exception:
+            paid = False
+        if paid:
+            awaiting_support_donation_payment.pop(user_id, None)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"✅ Спасибо за поддержку! Платёж {display_amount} получен.",
+                )
+            except Exception:
+                pass
+            for admin_id in ADMIN_USER_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"🤝 Поддержка бота: {display_amount} (≈ ${amount_usd:.2f}) от пользователя {user_id}",
+                    )
+                except Exception:
+                    pass
+            return
+        if now_ts() - start_time > PAYMENT_TIMEOUT:
+            awaiting_support_donation_payment.pop(user_id, None)
+            try:
+                await bot.send_message(user_id, "⏰ Время оплаты истекло. Если нужно — попробуйте ещё раз.")
+            except Exception:
+                pass
+            return
+
+
 async def prepare_betting_match(bot: Bot, lobby: Lobby):
     if lobby.mode != LobbyMode.betting or not lobby.stake_amount:
         return
@@ -4151,6 +4254,7 @@ async def cmd_admin(message: Message, bot: Bot):
 async def cb_back_menu(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     awaiting_code.discard(call.from_user.id)
+    awaiting_support_donation.pop(call.from_user.id, None)
     await show_menu(bot, call.message.chat.id, call.from_user, call.message)
 
 
@@ -4184,6 +4288,79 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot):
         render_profile_text(call.from_user),
         kb_profile(bool(settings.get("show_card_photos", 1)), bool(settings.get("allow_broadcast", 1))),
     )
+
+
+@router.callback_query(F.data == CB.MENU_SUPPORT_DONATE)
+async def cb_menu_support_donate(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
+    if not is_support_donations_enabled() or not cryptobot.enabled:
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Поддержка бота сейчас недоступна.",
+            kb_menu(),
+        )
+        return
+    active = awaiting_support_donation_payment.get(call.from_user.id)
+    if active and active.get("invoice_url"):
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            f"У вас уже есть активный счёт:\n{active['invoice_url']}",
+            kb_menu(),
+        )
+        return
+    awaiting_support_donation.pop(call.from_user.id, None)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "🤝 <b>Поддержка бота</b>\n\nВыберите валюту:",
+        kb_support_donate_currency(),
+    )
+
+
+@router.callback_query(F.data.startswith(CB.SUPPORT_DONATE_CUR))
+async def cb_support_donate_cur(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
+    if not is_support_donations_enabled() or not cryptobot.enabled:
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Поддержка бота сейчас недоступна.",
+            kb_menu(),
+        )
+        return
+    cur = call.data[len(CB.SUPPORT_DONATE_CUR):].strip().lower()
+    if cur not in ("usd", "rub"):
+        cur = "usd"
+    awaiting_support_donation[call.from_user.id] = {"currency": cur}
+    rate = get_support_rub_rate()
+    if cur == "rub":
+        prompt = f"Введите сумму в рублях.\nКурс: 1 USD = {rate:g} RUB"
+    else:
+        prompt = "Введите сумму в долларах (USD)."
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        prompt,
+        kb_support_donate_cancel(),
+    )
+
+
+@router.callback_query(F.data == CB.SUPPORT_DONATE_CANCEL)
+async def cb_support_donate_cancel(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    awaiting_support_donation.pop(call.from_user.id, None)
+    await show_menu(bot, call.message.chat.id, call.from_user, call.message)
 
 
 @router.callback_query(F.data == CB.PROFILE_TOGGLE_PHOTO)
@@ -5479,6 +5656,21 @@ async def cb_admin_toggle_broadcasts(call: CallbackQuery, bot: Bot):
     )
 
 
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_SUPPORT_DONATIONS)
+async def cb_admin_toggle_support_donations(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("support_donations_enabled", not is_support_donations_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Уведомления:",
+        kb_admin_settings_notify(),
+    )
+
+
 @router.callback_query(F.data == CB.ADMIN_TOGGLE_DEFAULT_PHOTO)
 async def cb_admin_toggle_default_photo(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
@@ -5977,6 +6169,92 @@ async def msg_any(message: Message, bot: Bot):
         if not await is_user_subscribed(bot, uid):
             await ensure_subscribed(bot, message.chat.id, message.from_user)
             return
+    if uid in awaiting_support_donation:
+        if not is_support_donations_enabled() or not cryptobot.enabled:
+            awaiting_support_donation.pop(uid, None)
+            await message.answer("Поддержка бота сейчас недоступна.")
+            return
+        state = awaiting_support_donation.get(uid, {})
+        cur = state.get("currency", "usd")
+        raw = text.replace(" ", "").replace(",", ".")
+        try:
+            amount = Decimal(raw)
+        except Exception:
+            await message.answer("Введите сумму числом (например 10 или 10.5).")
+            return
+        if amount <= 0:
+            await message.answer("Введите сумму больше 0.")
+            return
+        if uid in awaiting_support_donation_payment:
+            data = awaiting_support_donation_payment.get(uid, {})
+            url = data.get("invoice_url")
+            if url:
+                await message.answer(f"У вас уже есть активный счёт: {url}")
+            else:
+                await message.answer("У вас уже есть активный счёт. Дождитесь оплаты или таймаута.")
+            return
+        def _fmt_amount(val: Decimal) -> str:
+            s = format(val, "f")
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s if s else "0"
+        rate = get_support_rub_rate()
+        if cur == "rub":
+            usd_amount = (amount / Decimal(str(rate))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            display_amount = f"{_fmt_amount(amount)} RUB"
+        else:
+            usd_amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            display_amount = f"${_fmt_amount(amount)}"
+        if usd_amount <= 0:
+            await message.answer("Сумма слишком маленькая. Увеличьте и попробуйте ещё раз.")
+            return
+        awaiting_support_donation.pop(uid, None)
+        invoice = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                invoice = await cryptobot.create_invoice(
+                    amount=float(usd_amount),
+                    asset="USDT",
+                    description=f"Поддержка бота ({display_amount})",
+                    expires_in=PAYMENT_TIMEOUT,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(1 + attempt * 2)
+        if not invoice:
+            msg = str(last_err or "").lower()
+            log_message(f"Ошибка создания счёта поддержки: {last_err}")
+            if "min" in msg or "minimum" in msg or "amount" in msg or "small" in msg:
+                await message.answer(
+                    "CryptoBot не принимает такую сумму. Укажите сумму больше и попробуйте ещё раз."
+                )
+            else:
+                await message.answer("Не удалось создать счёт. Попробуйте позже.")
+            return
+        invoice_id = int(invoice.get("invoice_id", 0))
+        invoice_url = invoice.get("bot_invoice_url", "")
+        if invoice_id <= 0 or not invoice_url:
+            log_message(f"Счёт поддержки без ссылки: {invoice}")
+            await message.answer("Не удалось создать счёт. Попробуйте позже.")
+            return
+        awaiting_support_donation_payment[uid] = {
+            "invoice_id": invoice_id,
+            "invoice_url": invoice_url,
+            "amount_usd": float(usd_amount),
+            "display_amount": display_amount,
+        }
+        await message.answer(
+            f"🤝 Поддержка бота\n"
+            f"Сумма: {display_amount}\n"
+            f"К оплате (USDT): ${float(usd_amount):.2f}\n\n"
+            f"Ссылка: {invoice_url}"
+        )
+        asyncio.create_task(
+            check_support_donation_payment(bot, uid, invoice_id, float(usd_amount), display_amount)
+        )
+        return
     if uid in awaiting_code:
         awaiting_code.discard(uid)
         if not is_closed_enabled():
