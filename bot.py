@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -105,6 +105,16 @@ MENU_BUTTON_STYLE_LABELS = {
     "off": "Выкл",
 }
 SUPPORT_RUB_RATE_DEFAULT = 80.0
+BOT_USERNAME = ""
+
+# Бонусная система и рефералы
+# Важно: общий выпуск очков <= комиссии (POINTS_PLAYER_SHARE * (1 + REF_POINTS_RATE))
+POINTS_PER_USD = 100
+POINTS_PLAYER_SHARE = 0.45
+POINTS_WINNER_SHARE = 0.60
+REF_POINTS_RATE = 0.20
+REF_ACTIVATION_MATCHES = 3
+REDEEM_POINTS_PER_USD = 1000
 def now_ts() -> float:
     return time.time()
 
@@ -122,6 +132,32 @@ def gen_code(k: int = 6) -> str:
 
 def log_message(message: str):
     logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+
+def extract_start_arg(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip()
+
+
+def parse_referrer_arg(arg: str) -> Optional[int]:
+    if not arg:
+        return None
+    raw = arg.strip()
+    if raw.startswith("ref_"):
+        raw = raw[4:]
+    if not raw:
+        return None
+    if raw.isdigit():
+        try:
+            val = int(raw)
+            return val if val > 0 else None
+        except Exception:
+            return None
+    return None
 
 
 def check_db_connection() -> None:
@@ -149,6 +185,8 @@ def validate_config() -> bool:
         log_message("Внимание: CRYPTOBOT_TOKEN не задан — ставки будут отключены.")
         try:
             db.set_bool_setting("betting_enabled", False)
+            db.set_bool_setting("redeem_enabled", False)
+            db.set_bool_setting("support_donations_enabled", False)
         except Exception:
             pass
     if not REQUIRED_CHANNEL:
@@ -245,7 +283,8 @@ class Database:
                     finished_at TIMESTAMP,
                     crypto_invoice_id_p1 TEXT,
                     crypto_invoice_id_p2 TEXT,
-                    payout_check_hash TEXT
+                    payout_check_hash TEXT,
+                    points_awarded INTEGER DEFAULT 0
                 )
             """)
             
@@ -296,6 +335,35 @@ class Database:
                     show_card_photos INTEGER DEFAULT 1,
                     allow_broadcast INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_points (
+                    user_id BIGINT PRIMARY KEY,
+                    balance INTEGER DEFAULT 0,
+                    total_earned INTEGER DEFAULT 0,
+                    total_redeemed INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS points_ledger (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    delta INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    match_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS referrals (
+                    user_id BIGINT PRIMARY KEY,
+                    referrer_id BIGINT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    matches_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    activated_at TIMESTAMP
                 )
             """)
 
@@ -365,14 +433,15 @@ class Database:
                     winner_id INTEGER,
                     status TEXT DEFAULT 'waiting_payment',
                     commission_amount REAL,
-                    payout_amount REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    finished_at TIMESTAMP,
-                    crypto_invoice_id_p1 TEXT,
-                    crypto_invoice_id_p2 TEXT,
-                    payout_check_hash TEXT
-                )
-            """)
+                payout_amount REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                crypto_invoice_id_p1 TEXT,
+                crypto_invoice_id_p2 TEXT,
+                payout_check_hash TEXT,
+                points_awarded INTEGER DEFAULT 0
+            )
+        """)
             
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS betting_payments (
@@ -423,6 +492,35 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_points (
+                    user_id INTEGER PRIMARY KEY,
+                    balance INTEGER DEFAULT 0,
+                    total_earned INTEGER DEFAULT 0,
+                    total_redeemed INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS points_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    delta INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    match_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS referrals (
+                    user_id INTEGER PRIMARY KEY,
+                    referrer_id INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    matches_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    activated_at TIMESTAMP
+                )
+            """)
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS admin_broadcasts (
@@ -469,6 +567,8 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_broadcasts_status ON admin_broadcasts(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_points_ledger_user ON points_ledger(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
         
         # Настройки по умолчанию
         if self.db_kind == "postgres":
@@ -542,6 +642,21 @@ class Database:
                 "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
                 ("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)),
             )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("points_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("referral_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                ("redeem_enabled", "1"),
+            )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
@@ -599,11 +714,24 @@ class Database:
                 "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
                 ("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)),
             )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("points_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("referral_enabled", "1"),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO kv_settings (key, value) VALUES (?, ?)",
+                ("redeem_enabled", "1"),
+            )
         
         conn.commit()
         conn.close()
 
         self._ensure_column("support_tickets", "category", "TEXT DEFAULT 'Другое'")
+        self._ensure_column("betting_matches", "points_awarded", "INTEGER DEFAULT 0")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         try:
@@ -1049,6 +1177,17 @@ class Database:
 
             cursor.execute("SELECT COUNT(*) FROM admin_broadcasts WHERE status = 'active'")
             stats['active_broadcasts'] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT SUM(balance) FROM user_points")
+            stats["points_balance"] = cursor.fetchone()[0] or 0
+            cursor.execute("SELECT SUM(total_earned) FROM user_points")
+            stats["points_earned"] = cursor.fetchone()[0] or 0
+            cursor.execute("SELECT SUM(total_redeemed) FROM user_points")
+            stats["points_redeemed"] = cursor.fetchone()[0] or 0
+            cursor.execute("SELECT COUNT(*) FROM referrals")
+            stats["ref_total"] = cursor.fetchone()[0] or 0
+            cursor.execute("SELECT COUNT(*) FROM referrals WHERE status = 'active'")
+            stats["ref_active"] = cursor.fetchone()[0] or 0
             
             return stats
         finally:
@@ -1085,6 +1224,9 @@ class Database:
             "user_events",
             "user_balances",
             "user_settings",
+            "user_points",
+            "points_ledger",
+            "referrals",
             "admin_broadcasts",
             "kv_settings",
         ]
@@ -1101,6 +1243,81 @@ class Database:
                 cursor,
                 "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 ("betting_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("menu_button_style", "primary"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("maintenance_mode", "0"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("require_subscription", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("open_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("closed_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("ai_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("news_button_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("broadcasts_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("default_show_card_photos", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("default_allow_broadcast", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("support_donations_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("points_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("referral_enabled", "1"),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO kv_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("redeem_enabled", "1"),
             )
             conn.commit()
             return True
@@ -1152,6 +1369,11 @@ class Database:
                     (seconds_i,),
                 )
                 counts["admin_broadcasts"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM points_ledger WHERE created_at < NOW() - (%s * INTERVAL '1 second')",
+                    (seconds_i,),
+                )
+                counts["points_ledger"] = cursor.rowcount
             else:
                 delta = f"-{seconds_i} seconds"
                 cursor.execute(
@@ -1184,6 +1406,11 @@ class Database:
                     (delta,),
                 )
                 counts["admin_broadcasts"] = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM points_ledger WHERE created_at < datetime('now', ?)",
+                    (delta,),
+                )
+                counts["points_ledger"] = cursor.rowcount
 
             conn.commit()
             return counts
@@ -1205,6 +1432,237 @@ class Database:
             show_default = 1 if self.get_bool_setting("default_show_card_photos", True) else 0
             notify_default = 1 if self.get_bool_setting("default_allow_broadcast", True) else 0
             return {"user_id": user_id, "show_card_photos": show_default, "allow_broadcast": notify_default}
+        finally:
+            conn.close()
+
+    def get_points_profile(self, user_id: int) -> dict:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT balance, total_earned, total_redeemed FROM user_points WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "balance": int(row[0] or 0),
+                    "total_earned": int(row[1] or 0),
+                    "total_redeemed": int(row[2] or 0),
+                }
+            return {"balance": 0, "total_earned": 0, "total_redeemed": 0}
+        finally:
+            conn.close()
+
+    def add_points(self, user_id: int, points: int, reason: str, match_id: Optional[str] = None) -> bool:
+        if points <= 0:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            self._exec(
+                cursor,
+                """
+                INSERT INTO user_points (user_id, balance, total_earned)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    balance = user_points.balance + excluded.balance,
+                    total_earned = user_points.total_earned + excluded.total_earned,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, points, points),
+            )
+            self._exec(
+                cursor,
+                "INSERT INTO points_ledger (user_id, delta, reason, match_id) VALUES (?, ?, ?, ?)",
+                (user_id, points, reason, match_id),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            log_message(f"Ошибка начисления очков: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def redeem_points(self, user_id: int, points: int, reason: str = "redeem") -> bool:
+        if points <= 0:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            if self.db_kind == "postgres":
+                self._exec(
+                    cursor,
+                    """
+                    UPDATE user_points
+                    SET balance = balance - ?,
+                        total_redeemed = total_redeemed + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND balance >= ?
+                    """,
+                    (points, points, user_id, points),
+                )
+                if cursor.rowcount == 0:
+                    conn.rollback()
+                    return False
+            else:
+                cursor.execute("SELECT balance FROM user_points WHERE user_id = ?", (user_id,))
+                row = cursor.fetchone()
+                bal = int(row[0]) if row else 0
+                if bal < points:
+                    conn.rollback()
+                    return False
+                cursor.execute(
+                    """
+                    UPDATE user_points
+                    SET balance = balance - ?,
+                        total_redeemed = total_redeemed + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                    """,
+                    (points, points, user_id),
+                )
+            self._exec(
+                cursor,
+                "INSERT INTO points_ledger (user_id, delta, reason, match_id) VALUES (?, ?, ?, ?)",
+                (user_id, -points, reason, None),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            log_message(f"Ошибка списания очков: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def claim_points_for_match(self, match_id: str) -> Optional[dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT match_id, commission_amount, player1_id, player2_id, winner_id, points_awarded, status "
+                "FROM betting_matches WHERE match_id = ?",
+                (match_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            row_dict = dict(row)
+            if row_dict.get("status") != "finished":
+                return None
+            if row_dict.get("points_awarded"):
+                return None
+            cursor.execute(
+                "UPDATE betting_matches SET points_awarded = 1 WHERE match_id = ? AND (points_awarded IS NULL OR points_awarded = 0)",
+                (match_id,),
+            )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
+            conn.commit()
+            return row_dict
+        except Exception as e:
+            log_message(f"Ошибка отметки очков матча: {e}")
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+    def set_referrer(self, user_id: int, referrer_id: int) -> bool:
+        if user_id == referrer_id or referrer_id <= 0 or user_id <= 0:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            self._exec(
+                cursor,
+                "INSERT INTO referrals (user_id, referrer_id, status, matches_count) "
+                "VALUES (?, ?, 'pending', 0) ON CONFLICT(user_id) DO NOTHING",
+                (user_id, referrer_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            log_message(f"Ошибка сохранения реферала: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def get_referral_info(self, user_id: int) -> Optional[dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT referrer_id, status, matches_count FROM referrals WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def record_referral_match(self, user_id: int) -> Optional[dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT referrer_id, status, matches_count FROM referrals WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            referrer_id = int(row[0])
+            status = row[1] or "pending"
+            matches_count = int(row[2] or 0)
+            activated = False
+            if status != "active":
+                matches_count += 1
+                if matches_count >= REF_ACTIVATION_MATCHES:
+                    status = "active"
+                    activated = True
+                    cursor.execute(
+                        "UPDATE referrals SET status = 'active', matches_count = ?, activated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                        (matches_count, user_id),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE referrals SET matches_count = ? WHERE user_id = ?",
+                        (matches_count, user_id),
+                    )
+            conn.commit()
+            return {
+                "referrer_id": referrer_id,
+                "status": status,
+                "matches_count": matches_count,
+                "activated": activated,
+            }
+        except Exception as e:
+            log_message(f"Ошибка обновления реферала: {e}")
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+    def get_referral_stats(self, referrer_id: int) -> dict:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?",
+                (referrer_id,),
+            )
+            total = cursor.fetchone()[0] or 0
+            cursor.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = 'active'",
+                (referrer_id,),
+            )
+            active = cursor.fetchone()[0] or 0
+            return {"total": int(total), "active": int(active)}
         finally:
             conn.close()
 
@@ -1260,6 +1718,7 @@ class Database:
                 SELECT DISTINCT user_id FROM user_events
                 UNION SELECT user_id FROM user_balances
                 UNION SELECT user_id FROM support_tickets
+                UNION SELECT user_id FROM user_points
                 """
             )
             rows = cursor.fetchall()
@@ -2679,6 +3138,7 @@ awaiting_admin_cleanup: Dict[int, dict] = {}
 awaiting_payment: Dict[int, dict] = {}
 awaiting_support_donation: Dict[int, dict] = {}
 awaiting_support_donation_payment: Dict[int, dict] = {}
+awaiting_points_redeem: Dict[int, dict] = {}
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY) if Groq else None
 last_say_ts: Dict[int, float] = {}
@@ -2741,6 +3201,7 @@ class CB:
     ADMIN_SETTINGS_MODES = "a:settings:modes"
     ADMIN_SETTINGS_NOTIFY = "a:settings:notify"
     ADMIN_SETTINGS_DEFAULTS = "a:settings:defaults"
+    ADMIN_SETTINGS_BONUSES = "a:settings:bonuses"
     ADMIN_SUPPORT = "a:support"
     ADMIN_SUPPORT_OPEN = "a:support:open"
     ADMIN_SUPPORT_ALL = "a:support:all"
@@ -2763,6 +3224,9 @@ class CB:
     ADMIN_TOGGLE_NEWS = "a:toggle_news"
     ADMIN_TOGGLE_BROADCASTS = "a:toggle_broadcasts"
     ADMIN_TOGGLE_SUPPORT_DONATIONS = "a:toggle_support_donations"
+    ADMIN_TOGGLE_POINTS = "a:toggle_points"
+    ADMIN_TOGGLE_REFERRAL = "a:toggle_referral"
+    ADMIN_TOGGLE_REDEEM = "a:toggle_redeem"
     ADMIN_TOGGLE_DEFAULT_PHOTO = "a:toggle_def_photo"
     ADMIN_TOGGLE_DEFAULT_NOTIFY = "a:toggle_def_notify"
     ADMIN_CLEANUP = "a:cleanup"
@@ -2778,6 +3242,8 @@ class CB:
     SUPPORT_CLOSE = "s:close:"
     SUPPORT_DONATE_CUR = "s:donate:cur:"
     SUPPORT_DONATE_CANCEL = "s:donate:cancel"
+    PROFILE_REDEEM = "p:redeem"
+    POINTS_REDEEM_CANCEL = "p:redeem:cancel"
     PROFILE_TOGGLE_PHOTO = "p:photo"
     PROFILE_TOGGLE_NOTIFY = "p:notify"
     CHECK_SUB = "m:check_sub"
@@ -2855,6 +3321,18 @@ def is_support_donations_enabled() -> bool:
     return db.get_bool_setting("support_donations_enabled", True)
 
 
+def is_points_enabled() -> bool:
+    return db.get_bool_setting("points_enabled", True)
+
+
+def is_referral_enabled() -> bool:
+    return db.get_bool_setting("referral_enabled", True)
+
+
+def is_redeem_enabled() -> bool:
+    return db.get_bool_setting("redeem_enabled", True)
+
+
 def get_support_rub_rate() -> float:
     raw = db.get_setting("support_rub_rate", str(SUPPORT_RUB_RATE_DEFAULT)).strip()
     try:
@@ -2898,6 +3376,20 @@ def _news_url() -> str:
     if NEWS_CHANNEL_URL:
         return NEWS_CHANNEL_URL
     return _channel_url()
+
+
+def _bot_username() -> str:
+    uname = (BOT_USERNAME or os.environ.get("BOT_USERNAME", "")).strip()
+    if uname.startswith("@"):
+        uname = uname[1:]
+    return uname
+
+
+def build_referral_link(user_id: int) -> str:
+    uname = _bot_username()
+    if not uname:
+        return ""
+    return f"https://t.me/{uname}?start=ref_{user_id}"
 
 
 def _extract_tg_username(url: str) -> str:
@@ -3300,13 +3792,14 @@ def kb_admin_cleanup_cancel() -> InlineKeyboardMarkup:
 def kb_profile(show_photos: bool, allow_broadcast: bool) -> InlineKeyboardMarkup:
     photo_state = "Вкл" if show_photos else "Выкл"
     notif_state = "Вкл" if allow_broadcast else "Выкл"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Фото карт: {photo_state}", callback_data=CB.PROFILE_TOGGLE_PHOTO)],
-            [InlineKeyboardButton(text=f"Уведомления: {notif_state}", callback_data=CB.PROFILE_TOGGLE_NOTIFY)],
-            [InlineKeyboardButton(text="Назад", callback_data="back:menu")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text=f"Фото карт: {photo_state}", callback_data=CB.PROFILE_TOGGLE_PHOTO)],
+        [InlineKeyboardButton(text=f"Уведомления: {notif_state}", callback_data=CB.PROFILE_TOGGLE_NOTIFY)],
+    ]
+    if is_points_enabled() and is_redeem_enabled() and cryptobot.enabled:
+        rows.append([InlineKeyboardButton(text="🎁 Обмен очков", callback_data=CB.PROFILE_REDEEM)])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="back:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_admin_settings() -> InlineKeyboardMarkup:
     menu_style = get_menu_button_style()
@@ -3317,6 +3810,7 @@ def kb_admin_settings() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Режимы игр", callback_data=CB.ADMIN_SETTINGS_MODES)],
             [InlineKeyboardButton(text="Уведомления", callback_data=CB.ADMIN_SETTINGS_NOTIFY)],
             [InlineKeyboardButton(text="Профиль по умолчанию", callback_data=CB.ADMIN_SETTINGS_DEFAULTS)],
+            [InlineKeyboardButton(text="Бонусы и рефералы", callback_data=CB.ADMIN_SETTINGS_BONUSES)],
             [InlineKeyboardButton(text=f"Цвет меню: {menu_label}", callback_data=CB.ADMIN_MENU_STYLE)],
             [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_REFRESH)],
         ]
@@ -3379,6 +3873,20 @@ def kb_admin_settings_defaults() -> InlineKeyboardMarkup:
     )
 
 
+def kb_admin_settings_bonuses() -> InlineKeyboardMarkup:
+    points_state = "Вкл" if is_points_enabled() else "Выкл"
+    ref_state = "Вкл" if is_referral_enabled() else "Выкл"
+    redeem_state = "Вкл" if is_redeem_enabled() else "Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Очки: {points_state}", callback_data=CB.ADMIN_TOGGLE_POINTS)],
+            [InlineKeyboardButton(text=f"Рефералы: {ref_state}", callback_data=CB.ADMIN_TOGGLE_REFERRAL)],
+            [InlineKeyboardButton(text=f"Обмен очков: {redeem_state}", callback_data=CB.ADMIN_TOGGLE_REDEEM)],
+            [InlineKeyboardButton(text="Назад", callback_data=CB.ADMIN_SETTINGS)],
+        ]
+    )
+
+
 def kb_admin_menu_style() -> InlineKeyboardMarkup:
     current = get_menu_button_style()
     rows = []
@@ -3407,6 +3915,9 @@ def render_admin_text() -> str:
     open_state = "Вкл" if is_open_enabled() else "Выкл"
     closed_state = "Вкл" if is_closed_enabled() else "Выкл"
     ai_state = "Вкл" if is_ai_enabled() else "Выкл"
+    points_state = "Вкл" if is_points_enabled() else "Выкл"
+    ref_state = "Вкл" if is_referral_enabled() else "Выкл"
+    redeem_state = "Вкл" if is_redeem_enabled() else "Выкл"
     return (
         f"<b>Админ панель</b>\n\n"
         f"💰 Доход (комиссия): ${stats['total_commission']:.2f}\n"
@@ -3415,11 +3926,15 @@ def render_admin_text() -> str:
         f"👥 Пользователей: {stats['total_users']}\n"
         f"🚀 Первых запусков: {total_starts}\n"
         f"💵 Балансы: ${stats['total_user_balance']:.2f}\n"
+        f"⭐ Очки в обороте: {int(stats.get('points_balance', 0))}\n"
+        f"✨ Очки выдано/списано: {int(stats.get('points_earned', 0))} / {int(stats.get('points_redeemed', 0))}\n"
+        f"🔗 Рефералы: {stats.get('ref_total', 0)} (активных {stats.get('ref_active', 0)})\n"
         f"🆘 Открытых тикетов: {stats['open_tickets']}\n"
         f"📢 Уведомлений активно: {stats['active_broadcasts']}\n"
         f"🛠️ Тех. работы: {maint}\n"
         f"🔐 Подписка обязательна: {sub_req}\n"
         f"🎛️ Режимы: открытая {open_state}, закрытая {closed_state}, ИИ {ai_state}\n"
+        f"🎁 Бонусы: очки {points_state}, рефералы {ref_state}, обмен {redeem_state}\n"
         f"🗄️ DB: {db_status} • {db_ping_txt}\n"
     )
 
@@ -3563,6 +4078,12 @@ def kb_support_donate_currency() -> InlineKeyboardMarkup:
 def kb_support_donate_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.SUPPORT_DONATE_CANCEL)]]
+    )
+
+
+def kb_points_redeem_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=CB.POINTS_REDEEM_CANCEL)]]
     )
 
 
@@ -3776,6 +4297,12 @@ def rules_text() -> str:
         "• Настройки:\n"
         "  – «Фото карт»: выключи, если не хочешь получать картинки карт.\n"
         "  – «Уведомления»: управление сообщениями от администрации.\n\n"
+        "<b>6.5. Бонусы и рефералы</b>\n"
+        "• За игры на ставках начисляются бонусные очки.\n"
+        "• Очки начисляются из комиссии — бот всегда остаётся в плюсе.\n"
+        f"• Курс обмена: {REDEEM_POINTS_PER_USD} очков = 1 USDT.\n"
+        f"• Реферальные бонусы активируются после {REF_ACTIVATION_MATCHES} матчей приглашённого игрока.\n"
+        "• Ваша реферальная ссылка отображается в профиле.\n\n"
         "<b>7. Поддержка</b>\n"
         "• Нажми «Поддержка» и выбери тип проблемы:\n"
         "  – Не пришла выплата\n"
@@ -4235,11 +4762,29 @@ async def show_menu(bot: Bot, chat_id: int, user, message: Message = None):
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
     db.record_user_event(message.from_user.id, "start")
+    awaiting_points_redeem.pop(message.from_user.id, None)
+    if is_referral_enabled():
+        arg = extract_start_arg(message.text)
+        ref_id = parse_referrer_arg(arg)
+        if ref_id and ref_id != message.from_user.id:
+            if db.set_referrer(message.from_user.id, ref_id):
+                try:
+                    await bot.send_message(
+                        ref_id,
+                        f"🔗 У вас новый приглашённый: {human_name(message.from_user)} (ID {message.from_user.id}).",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await message.answer("✅ Вы присоединились по приглашению. Играйте и копите очки!")
+                except Exception:
+                    pass
     await show_menu(bot, message.chat.id, message.from_user)
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, bot: Bot):
+    awaiting_points_redeem.pop(message.from_user.id, None)
     await show_menu(bot, message.chat.id, message.from_user)
 
 
@@ -4255,6 +4800,7 @@ async def cb_back_menu(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     awaiting_code.discard(call.from_user.id)
     awaiting_support_donation.pop(call.from_user.id, None)
+    awaiting_points_redeem.pop(call.from_user.id, None)
     await show_menu(bot, call.message.chat.id, call.from_user, call.message)
 
 
@@ -4280,6 +4826,51 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
+    settings = get_cached_user_settings(call.from_user.id)
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        render_profile_text(call.from_user),
+        kb_profile(bool(settings.get("show_card_photos", 1)), bool(settings.get("allow_broadcast", 1))),
+    )
+
+
+@router.callback_query(F.data == CB.PROFILE_REDEEM)
+async def cb_profile_redeem(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not await ensure_subscribed_for_call(call, bot):
+        return
+    if not is_points_enabled() or not is_redeem_enabled() or not cryptobot.enabled:
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Обмен очков сейчас недоступен.",
+            kb_menu(),
+        )
+        return
+    profile = db.get_points_profile(call.from_user.id)
+    balance = profile.get("balance", 0)
+    awaiting_points_redeem[call.from_user.id] = {"balance": balance}
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        (
+            "🎁 <b>Обмен очков</b>\n\n"
+            f"Баланс очков: <b>{balance}</b>\n"
+            f"Курс: <b>{REDEEM_POINTS_PER_USD} очков = 1 USDT</b>\n\n"
+            "Введите сумму в USDT, которую хотите получить."
+        ),
+        kb_points_redeem_cancel(),
+    )
+
+
+@router.callback_query(F.data == CB.POINTS_REDEEM_CANCEL)
+async def cb_points_redeem_cancel(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    awaiting_points_redeem.pop(call.from_user.id, None)
     settings = get_cached_user_settings(call.from_user.id)
     await safe_edit_text(
         bot,
@@ -5249,6 +5840,20 @@ async def cb_admin_settings_defaults(call: CallbackQuery, bot: Bot):
     )
 
 
+@router.callback_query(F.data == CB.ADMIN_SETTINGS_BONUSES)
+async def cb_admin_settings_bonuses(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Бонусы и рефералы:",
+        kb_admin_settings_bonuses(),
+    )
+
+
 @router.callback_query(F.data == CB.ADMIN_NOTIFY)
 async def cb_admin_notify(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
@@ -5668,6 +6273,51 @@ async def cb_admin_toggle_support_donations(call: CallbackQuery, bot: Bot):
         call.message.message_id,
         "Уведомления:",
         kb_admin_settings_notify(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_POINTS)
+async def cb_admin_toggle_points(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("points_enabled", not is_points_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Бонусы и рефералы:",
+        kb_admin_settings_bonuses(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_REFERRAL)
+async def cb_admin_toggle_referral(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("referral_enabled", not is_referral_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Бонусы и рефералы:",
+        kb_admin_settings_bonuses(),
+    )
+
+
+@router.callback_query(F.data == CB.ADMIN_TOGGLE_REDEEM)
+async def cb_admin_toggle_redeem(call: CallbackQuery, bot: Bot):
+    await safe_answer(call)
+    if not is_admin(call.from_user.id):
+        return
+    db.set_bool_setting("redeem_enabled", not is_redeem_enabled())
+    await safe_edit_text(
+        bot,
+        call.message.chat.id,
+        call.message.message_id,
+        "Бонусы и рефералы:",
+        kb_admin_settings_bonuses(),
     )
 
 
@@ -6169,6 +6819,86 @@ async def msg_any(message: Message, bot: Bot):
         if not await is_user_subscribed(bot, uid):
             await ensure_subscribed(bot, message.chat.id, message.from_user)
             return
+    if uid in awaiting_points_redeem:
+        if not is_points_enabled() or not is_redeem_enabled() or not cryptobot.enabled:
+            awaiting_points_redeem.pop(uid, None)
+            await message.answer("Обмен очков сейчас недоступен.")
+            return
+        raw = text.replace(" ", "").replace(",", ".")
+        try:
+            amount = Decimal(raw)
+        except Exception:
+            await message.answer("Введите сумму числом (например 1 или 1.5).")
+            return
+        if amount <= 0:
+            await message.answer("Введите сумму больше 0.")
+            return
+        amount_usd = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if amount_usd <= 0:
+            await message.answer("Сумма слишком маленькая.")
+            return
+        points_needed = int(
+            (amount_usd * Decimal(REDEEM_POINTS_PER_USD)).to_integral_value(rounding=ROUND_CEILING)
+        )
+        balance = db.get_points_profile(uid).get("balance", 0)
+        if points_needed <= 0:
+            await message.answer("Сумма слишком маленькая.")
+            return
+        if balance < points_needed:
+            await message.answer(
+                f"Недостаточно очков. Нужно {points_needed}, у вас {balance}."
+            )
+            return
+        awaiting_points_redeem.pop(uid, None)
+        check = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                check = await cryptobot.create_check(
+                    asset="USDT",
+                    amount=float(amount_usd),
+                    description=f"Обмен очков ({points_needed} pts)",
+                )
+                break
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(1 + attempt * 2)
+        if not check:
+            msg = str(last_err or "").lower()
+            log_message(f"Ошибка обмена очков: {last_err}")
+            if "min" in msg or "minimum" in msg or "amount" in msg or "small" in msg:
+                await message.answer(
+                    "CryptoBot не принимает такую сумму. Укажите сумму больше и попробуйте ещё раз."
+                )
+            else:
+                await message.answer("Не удалось создать чек. Попробуйте позже.")
+            return
+        check_hash, check_url = extract_check_data(check)
+        if not check_url and not check_hash:
+            await message.answer("Чек создан, но ссылка недоступна. Напишите администратору.")
+            return
+        if not db.redeem_points(uid, points_needed):
+            await message.answer("Не удалось списать очки. Попробуйте позже.")
+            return
+        msg = (
+            "🎁 <b>Обмен очков</b>\n\n"
+            f"Списано: <b>{points_needed}</b> очков\n"
+            f"Сумма: <b>${amount_usd:.2f}</b>\n\n"
+        )
+        if check_url:
+            msg += f"Чек: {check_url}"
+        else:
+            msg += f"Код чека: <code>{check_hash}</code>"
+        await message.answer(msg, parse_mode=ParseMode.HTML)
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 Обмен очков: {points_needed} pts → ${amount_usd:.2f} (user {uid})",
+                )
+            except Exception:
+                pass
+        return
     if uid in awaiting_support_donation:
         if not is_support_donations_enabled() or not cryptobot.enabled:
             awaiting_support_donation.pop(uid, None)
@@ -6351,6 +7081,7 @@ async def msg_any(message: Message, bot: Bot):
             "betting_payments": "платежи",
             "betting_matches": "матчи",
             "admin_broadcasts": "уведомления",
+            "points_ledger": "журнал очков",
         }
         lines = ["Очистка завершена.", f"Удалено всего: {total}"]
         for key, val in counts.items():
@@ -6578,6 +7309,112 @@ async def update_lobby_ui(bot: Bot, lobby: Lobby):
             except Exception:
                 pass
 
+
+def extract_check_data(check: dict) -> Tuple[str, str]:
+    def _pick(d: dict, keys: List[str]) -> str:
+        for k in keys:
+            v = d.get(k)
+            if v:
+                return str(v)
+        return ""
+    check_hash = _pick(check, ["checkCode", "check_code", "check_hash", "hash", "code", "checkId", "check_id"])
+    check_url = _pick(check, ["botCheckUrl", "bot_check_url", "checkUrl", "check_url", "url"])
+    if not check_url and check_hash:
+        check_url = f"https://t.me/CryptoBot?start=check_{check_hash}"
+    return check_hash, check_url
+
+
+async def award_points_for_match(bot: Bot, lobby: Lobby, match_id: str) -> None:
+    if lobby.mode != LobbyMode.betting:
+        return
+    if not is_points_enabled():
+        return
+    info = db.claim_points_for_match(match_id)
+    if not info:
+        return
+    try:
+        commission = float(info.get("commission_amount") or 0.0)
+    except Exception:
+        commission = 0.0
+    if commission <= 0:
+        return
+    p1 = info.get("player1_id")
+    p2 = info.get("player2_id")
+    winner_id = info.get("winner_id")
+    if not winner_id or winner_id not in (p1, p2):
+        return
+    loser_id = p2 if winner_id == p1 else p1
+    total_points = int(commission * POINTS_PER_USD * POINTS_PLAYER_SHARE)
+    if total_points <= 0:
+        return
+    winner_points = int(total_points * POINTS_WINNER_SHARE)
+    loser_points = max(0, total_points - winner_points)
+
+    def _name(uid: int) -> str:
+        pl = lobby.get_player(uid) if lobby else None
+        return pl.name if pl else str(uid)
+
+    if winner_points > 0:
+        db.add_points(winner_id, winner_points, "match_win", match_id)
+    if loser_points > 0:
+        db.add_points(loser_id, loser_points, "match_play", match_id)
+
+    try:
+        if winner_points > 0:
+            bal = db.get_points_profile(winner_id).get("balance", 0)
+            await bot.send_message(
+                winner_id,
+                f"⭐ За матч вы получили <b>{winner_points}</b> очков.\nБаланс: <b>{bal}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        if loser_points > 0:
+            bal = db.get_points_profile(loser_id).get("balance", 0)
+            await bot.send_message(
+                loser_id,
+                f"⭐ За участие вы получили <b>{loser_points}</b> очков.\nБаланс: <b>{bal}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        pass
+
+    if not is_referral_enabled():
+        return
+    for uid, pts in ((winner_id, winner_points), (loser_id, loser_points)):
+        ref_info = db.record_referral_match(uid)
+        if not ref_info:
+            continue
+        referrer_id = ref_info.get("referrer_id")
+        activated = ref_info.get("activated")
+        status = ref_info.get("status")
+        if activated:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"✅ Ваш реферал {_name(uid)} активировался (сыграл {REF_ACTIVATION_MATCHES} матча).",
+                )
+            except Exception:
+                pass
+            try:
+                await bot.send_message(
+                    uid,
+                    "🎉 Ваш аккаунт активировал реферальную систему. Теперь ваши матчи приносят бонусы пригласившему.",
+                )
+            except Exception:
+                pass
+        if status == "active" and pts > 0:
+            bonus = int(pts * REF_POINTS_RATE)
+            if bonus > 0:
+                db.add_points(referrer_id, bonus, "ref_bonus", match_id)
+                try:
+                    bal = db.get_points_profile(referrer_id).get("balance", 0)
+                    await bot.send_message(
+                        referrer_id,
+                        f"🤝 Реферал {_name(uid)} принёс вам <b>+{bonus}</b> очков.\nБаланс: <b>{bal}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
 async def finalize_betting_payout(bot: Bot, lobby: Lobby, gs: GameState):
     if lobby.mode != LobbyMode.betting:
         return
@@ -6599,6 +7436,7 @@ async def finalize_betting_payout(bot: Bot, lobby: Lobby, gs: GameState):
             match = db.get_match_by_id(match_id) or match
         else:
             payout = match.get("payout_amount")
+        await award_points_for_match(bot, lobby, match_id)
         if not payout:
             return
         if db.has_payout(match_id, winner_id):
@@ -6621,16 +7459,7 @@ async def finalize_betting_payout(bot: Bot, lobby: Lobby, gs: GameState):
                     await asyncio.sleep(2 + attempt * 3)
             if not check:
                 raise last_err or Exception("Не удалось создать чек")
-            def _pick(d: dict, keys: list[str]) -> str:
-                for k in keys:
-                    v = d.get(k)
-                    if v:
-                        return str(v)
-                return ""
-            check_hash = _pick(check, ["checkCode", "check_code", "check_hash", "hash", "code", "checkId", "check_id"])
-            check_url = _pick(check, ["botCheckUrl", "bot_check_url", "checkUrl", "check_url", "url"])
-            if not check_url and check_hash:
-                check_url = f"https://t.me/CryptoBot?start=check_{check_hash}"
+            check_hash, check_url = extract_check_data(check)
             db.create_payout_check(match_id, winner_id, payout, check_hash, check_url)
             if check_url:
                 msg = (
@@ -6807,7 +7636,31 @@ def render_profile_text(user) -> str:
     withdrawn = profile.get("total_withdrawn", 0.0)
     show_photos = "Вкл" if settings.get("show_card_photos", 1) else "Выкл"
     allow_broadcast = "Вкл" if settings.get("allow_broadcast", 1) else "Выкл"
+    points = db.get_points_profile(user.id) if is_points_enabled() else {"balance": 0, "total_earned": 0, "total_redeemed": 0}
+    ref_stats = db.get_referral_stats(user.id) if is_referral_enabled() else {"total": 0, "active": 0}
+    ref_link = build_referral_link(user.id) if is_referral_enabled() else ""
     uname = human_name(user)
+    points_block = ""
+    if is_points_enabled():
+        points_block = (
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>⭐ Очки</b>\n"
+            f"• Баланс: <b>{points.get('balance', 0)}</b>\n"
+            f"• Получено: <b>{points.get('total_earned', 0)}</b>\n"
+            f"• Списано: <b>{points.get('total_redeemed', 0)}</b>\n"
+            f"<i>Курс: {REDEEM_POINTS_PER_USD} очков = 1 USDT</i>\n"
+        )
+    referral_block = ""
+    if is_referral_enabled():
+        link_line = f"\n<code>{html.escape(ref_link)}</code>" if ref_link else "\n<i>Ссылка станет доступна после запуска бота.</i>"
+        referral_block = (
+            "━━━━━━━━━━━━━━━━\n"
+            "<b>🔗 Рефералы</b>\n"
+            f"• Всего: <b>{ref_stats.get('total', 0)}</b>\n"
+            f"• Активных: <b>{ref_stats.get('active', 0)}</b>\n"
+            "• Ваша ссылка:"
+            f"{link_line}\n"
+        )
     return (
         "<b>👤 Профиль игрока</b>\n"
         f"<code>UID: {user.id}</code>\n"
@@ -6819,6 +7672,8 @@ def render_profile_text(user) -> str:
         f"• Проигрыш: <b>${total_lost:.2f}</b>\n"
         f"• Депозит: <b>${deposited:.2f}</b>\n"
         f"• Вывод: <b>${withdrawn:.2f}</b>\n"
+        f"{points_block}"
+        f"{referral_block}"
         "━━━━━━━━━━━━━━━━\n"
         "<b>⚙️ Настройки</b>\n"
         f"• Фото карт: <b>{show_photos}</b>\n"
@@ -6932,6 +7787,12 @@ async def main():
     if not validate_config():
         return
     bot = Bot(token=TOKEN)
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = getattr(me, "username", "") or BOT_USERNAME
+    except Exception:
+        pass
     dp = Dispatcher()
     dp.include_router(router)
     server = await start_render_server()
