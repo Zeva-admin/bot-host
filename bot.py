@@ -13,13 +13,14 @@ import html
 import platform
 import sys
 import signal
+import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8788323258:AAESyyBf_-S2MHuklb0bTJrgls_am0Wazm4"
+TOKEN = "8254655034:AAEzNUxDUBgCYljvIwCCmHnCaeU9zCroA2I, 8788323258:AAESyyBf_-S2MHuklb0bTJrgls_am0Wazm4"
 GROQ_API_KEY = "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"
 CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
@@ -105,7 +106,8 @@ MENU_BUTTON_STYLE_LABELS = {
     "off": "Выкл",
 }
 SUPPORT_RUB_RATE_DEFAULT = 80.0
-BOT_USERNAME = ""
+BOT_USERNAME = "cartplaybot"
+BOT_USERNAMES: List[str] = []
 
 # Бонусная система и рефералы
 # Важно: общий выпуск очков <= комиссии (POINTS_PLAYER_SHARE * (1 + REF_POINTS_RATE))
@@ -118,20 +120,158 @@ REDEEM_POINTS_PER_USD = 1000
 def now_ts() -> float:
     return time.time()
 
-START_TS = now_ts()
-SUBSCRIPTION_CACHE: Dict[int, float] = {}
-SUBSCRIPTION_TTL = 300.0
-NOTICE_CACHE: Dict[str, Optional[object]] = {"ts": 0.0, "text": None}
-USER_SETTINGS_CACHE: Dict[int, Tuple[float, dict]] = {}
-USER_SETTINGS_TTL = 300.0
-SHUTDOWN_EVENT = asyncio.Event()
-
 def gen_code(k: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(random.choice(alphabet) for _ in range(k))
 
 def log_message(message: str):
     logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+
+def _split_tokens(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
+    return [p for p in parts if p]
+
+
+BOT_TOKENS = _split_tokens(TOKEN)
+
+# Текущий бот (для разделения состояния и БД)
+CURRENT_BOT_KEY = contextvars.ContextVar("CURRENT_BOT_KEY", default="bot1")
+BOT_ID_MAP: Dict[int, str] = {}
+
+
+def current_bot_key() -> str:
+    return CURRENT_BOT_KEY.get() or "bot1"
+
+
+def bot_key_from_bot(bot: Optional[Bot]) -> str:
+    if bot and getattr(bot, "id", None) in BOT_ID_MAP:
+        return BOT_ID_MAP[bot.id]
+    return "bot1"
+
+
+class BotContextMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        bot = data.get("bot")
+        key = bot_key_from_bot(bot)
+        token = CURRENT_BOT_KEY.set(key)
+        try:
+            return await handler(event, data)
+        finally:
+            CURRENT_BOT_KEY.reset(token)
+
+
+class BotScopedSet:
+    def __init__(self):
+        self._data: Dict[str, Set] = {}
+
+    def _set(self) -> Set:
+        key = current_bot_key()
+        if key not in self._data:
+            self._data[key] = set()
+        return self._data[key]
+
+    def add(self, value):
+        self._set().add(value)
+
+    def discard(self, value):
+        self._set().discard(value)
+
+    def remove(self, value):
+        self._set().remove(value)
+
+    def pop(self):
+        return self._set().pop()
+
+    def clear(self):
+        self._set().clear()
+
+    def __contains__(self, value):
+        return value in self._set()
+
+    def __iter__(self):
+        return iter(self._set())
+
+    def __len__(self):
+        return len(self._set())
+
+
+class BotScopedDict:
+    _MISSING = object()
+
+    def __init__(self, default_factory=None):
+        self._data: Dict[str, Dict] = {}
+        self._factory = default_factory
+
+    def _dict(self) -> Dict:
+        key = current_bot_key()
+        if key not in self._data:
+            self._data[key] = self._factory() if self._factory else {}
+        return self._data[key]
+
+    def __getitem__(self, key):
+        return self._dict()[key]
+
+    def __setitem__(self, key, value):
+        self._dict()[key] = value
+
+    def get(self, key, default=None):
+        return self._dict().get(key, default)
+
+    def pop(self, key, default=_MISSING):
+        if default is self._MISSING:
+            return self._dict().pop(key)
+        return self._dict().pop(key, default)
+
+    def items(self):
+        return self._dict().items()
+
+    def values(self):
+        return self._dict().values()
+
+    def keys(self):
+        return self._dict().keys()
+
+    def setdefault(self, key, default=None):
+        return self._dict().setdefault(key, default)
+
+    def clear(self):
+        self._dict().clear()
+
+    def __contains__(self, key):
+        return key in self._dict()
+
+    def __iter__(self):
+        return iter(self._dict())
+
+    def __len__(self):
+        return len(self._dict())
+
+
+class BotScopedObject:
+    def __init__(self, factory):
+        self._factory = factory
+        self._objects: Dict[str, object] = {}
+
+    def _obj(self):
+        key = current_bot_key()
+        if key not in self._objects:
+            self._objects[key] = self._factory()
+        return self._objects[key]
+
+    def __getattr__(self, name):
+        return getattr(self._obj(), name)
+
+
+START_TS = now_ts()
+SUBSCRIPTION_CACHE: BotScopedDict = BotScopedDict()
+SUBSCRIPTION_TTL = 300.0
+NOTICE_CACHE: BotScopedDict = BotScopedDict(default_factory=lambda: {"ts": 0.0, "text": None})
+USER_SETTINGS_CACHE: BotScopedDict = BotScopedDict()
+USER_SETTINGS_TTL = 300.0
+SHUTDOWN_EVENT = asyncio.Event()
 
 
 def extract_start_arg(text: Optional[str]) -> str:
@@ -151,12 +291,16 @@ def parse_referrer_arg(arg: str) -> Optional[int]:
         raw = raw[4:]
     if not raw:
         return None
-    if raw.isdigit():
-        try:
-            val = int(raw)
-            return val if val > 0 else None
-        except Exception:
-            return None
+    i = 0
+    while i < len(raw) and raw[i].isdigit():
+        i += 1
+    if i == 0:
+        return None
+    try:
+        val = int(raw[:i])
+        return val if val > 0 else None
+    except Exception:
+        return None
     return None
 
 
@@ -176,7 +320,7 @@ def check_db_connection() -> None:
 
 def validate_config() -> bool:
     ok = True
-    if not TOKEN:
+    if not BOT_TOKENS:
         log_message("ОШИБКА: BOT_TOKEN не задан. Бот не может быть запущен.")
         ok = False
     if not DATABASE_URL:
@@ -197,25 +341,18 @@ def validate_config() -> bool:
 # БАЗА ДАННЫХ (УМНАЯ, ВСЁ В ОДНОМ ФАЙЛЕ)
 # =============================================================================
 class Database:
-    _instance: Optional['Database'] = None
-    
-    def __new__(cls) -> 'Database':
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        if self._initialized:
-            return
-        self.db_path = STATS_DB_PATH
-        self.db_url = DATABASE_URL
+    def __init__(self, db_url: Optional[str] = None, db_path: Optional[Path] = None, schema: Optional[str] = None):
+        self.db_path = db_path or STATS_DB_PATH
+        self.db_url = db_url if db_url is not None else DATABASE_URL
         self.db_kind = "postgres" if self.db_url else "sqlite"
+        self.schema = schema
+        self._schema_ready = False
         self._kv_cache: Dict[str, str] = {}
         self._kv_cache_ts = 0.0
         self._kv_cache_ttl = 30.0
+        if self.db_kind == "postgres" and self.schema:
+            self._ensure_schema()
         self._init_db()
-        self._initialized = True
         log_message("База данных инициализирована")
     
     def _get_connection(self):
@@ -233,10 +370,40 @@ class Database:
             if self.db_url and "sslmode=" not in self.db_url:
                 conn_kwargs["sslmode"] = "require"
             conn = psycopg2.connect(self.db_url, **conn_kwargs)
+            if self.schema:
+                try:
+                    cur = conn.cursor()
+                    cur.execute(f'SET search_path TO "{self.schema}"')
+                except Exception:
+                    pass
             return conn
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_schema(self) -> None:
+        if self._schema_ready or not self.schema or self.db_kind != "postgres":
+            return
+        try:
+            import psycopg2
+        except Exception:
+            return
+        conn_kwargs: Dict[str, object] = {}
+        if self.db_url and "sslmode=" not in self.db_url:
+            conn_kwargs["sslmode"] = "require"
+        conn = psycopg2.connect(self.db_url, **conn_kwargs)
+        try:
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+            self._schema_ready = True
+        except Exception as e:
+            log_message(f"Ошибка создания схемы {self.schema}: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _adapt_sql(self, sql: str) -> str:
         if self.db_kind == "postgres":
@@ -738,11 +905,18 @@ class Database:
             with self._get_connection() as conn:
                 cur = conn.cursor()
                 if self.db_kind == "postgres":
-                    self._exec(
-                        cur,
-                        "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
-                        (table, column),
-                    )
+                    if self.schema:
+                        self._exec(
+                            cur,
+                            "SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+                            (self.schema, table, column),
+                        )
+                    else:
+                        self._exec(
+                            cur,
+                            "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?",
+                            (table, column),
+                        )
                     if cur.fetchone():
                         return
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -1974,7 +2148,47 @@ class Database:
         finally:
             conn.close()
 
-db = Database()
+class DatabaseManager:
+    def __init__(self):
+        self._dbs: Dict[str, Database] = {}
+
+    def _index_from_key(self, key: str) -> int:
+        if key.startswith("bot"):
+            tail = key[3:]
+            if tail.isdigit():
+                return max(1, int(tail))
+        return 1
+
+    def get(self, key: str) -> Database:
+        if key in self._dbs:
+            return self._dbs[key]
+        idx = self._index_from_key(key)
+        if DATABASE_URL:
+            schema = None
+            if idx > 1:
+                schema = f"bot{idx}"
+            db = Database(db_url=DATABASE_URL, schema=schema)
+        else:
+            path = STATS_DB_PATH
+            if idx > 1:
+                path = STATS_DB_PATH.with_name(f"{STATS_DB_PATH.stem}_bot{idx}{STATS_DB_PATH.suffix}")
+            db = Database(db_path=path)
+        self._dbs[key] = db
+        return db
+
+
+class DBProxy:
+    def __init__(self, manager: DatabaseManager):
+        self._manager = manager
+
+    def _db(self) -> Database:
+        return self._manager.get(current_bot_key())
+
+    def __getattr__(self, name):
+        return getattr(self._db(), name)
+
+
+db = DBProxy(DatabaseManager())
 
 # =============================================================================
 # CRYPTOBOT API CLIENT
@@ -2526,7 +2740,7 @@ class LobbyManager:
                     pass
             self._remove_lobby(lobby)
 
-lobbies = LobbyManager()
+lobbies = BotScopedObject(lambda: LobbyManager())
 
 # =============================================================================
 # ИГРОВОЙ ДВИЖОК
@@ -2882,7 +3096,7 @@ class GameEngine:
         gs.last_action_ts = now_ts()
         self._check_endgame(lobby)
 
-engine = GameEngine()
+engine = BotScopedObject(lambda: GameEngine())
 
 class GroqDurakAI:
     def __init__(self, api_key: str):
@@ -3128,21 +3342,21 @@ class GroqDurakAI:
 # =============================================================================
 # СОСТОЯНИЕ
 # =============================================================================
-awaiting_code: Set[int] = set()
-awaiting_admin_message: Set[int] = set()
-awaiting_support_message: Set[int] = set()
-awaiting_support_category: Dict[int, str] = {}
-awaiting_support_reply: Dict[int, int] = {}
-awaiting_admin_broadcast: Dict[int, dict] = {}
-awaiting_admin_cleanup: Dict[int, dict] = {}
-awaiting_payment: Dict[int, dict] = {}
-awaiting_support_donation: Dict[int, dict] = {}
-awaiting_support_donation_payment: Dict[int, dict] = {}
-awaiting_points_redeem: Dict[int, dict] = {}
+awaiting_code = BotScopedSet()
+awaiting_admin_message = BotScopedSet()
+awaiting_support_message = BotScopedSet()
+awaiting_support_category = BotScopedDict()
+awaiting_support_reply = BotScopedDict()
+awaiting_admin_broadcast = BotScopedDict()
+awaiting_admin_cleanup = BotScopedDict()
+awaiting_payment = BotScopedDict()
+awaiting_support_donation = BotScopedDict()
+awaiting_support_donation_payment = BotScopedDict()
+awaiting_points_redeem = BotScopedDict()
 router = Router()
 ai_service = GroqDurakAI(api_key=GROQ_API_KEY) if Groq else None
-last_say_ts: Dict[int, float] = {}
-payout_locks: Dict[str, asyncio.Lock] = {}
+last_say_ts = BotScopedDict()
+payout_locks = BotScopedDict()
 
 # =============================================================================
 # CALLBACKS / UI / HELPERS
@@ -3378,18 +3592,25 @@ def _news_url() -> str:
     return _channel_url()
 
 
-def _bot_username() -> str:
-    uname = (BOT_USERNAME or os.environ.get("BOT_USERNAME", "")).strip()
+def _bot_username(index: int = 0) -> str:
+    uname = ""
+    if BOT_USERNAMES and 0 <= index < len(BOT_USERNAMES):
+        uname = BOT_USERNAMES[index]
+    if not uname:
+        uname = (BOT_USERNAME or os.environ.get("BOT_USERNAME", "")).strip()
     if uname.startswith("@"):
         uname = uname[1:]
     return uname
 
 
-def build_referral_link(user_id: int) -> str:
-    uname = _bot_username()
+def build_referral_link(user_id: int, bot_index: int = 0) -> str:
+    uname = _bot_username(bot_index)
     if not uname:
         return ""
-    return f"https://t.me/{uname}?start=ref_{user_id}"
+    suffix = ""
+    if bot_index >= 1:
+        suffix = f"_bot{bot_index + 1}"
+    return f"https://t.me/{uname}?start=ref_{user_id}{suffix}"
 
 
 def _extract_tg_username(url: str) -> str:
@@ -3993,14 +4214,18 @@ def render_admin_system_text(db_ok: bool, db_ping_ms: Optional[float], db_err: O
     minutes = (uptime % 3600) // 60
     db_size = 0
     try:
-        db_size = os.path.getsize(STATS_DB_PATH)
+        if getattr(db, "db_path", None):
+            db_size = os.path.getsize(db.db_path)
     except Exception:
         pass
     status_icon = "✅" if cryptobot.enabled else "❌"
     ai_icon = "✅" if ai_service else "❌"
     token_mask = "нет"
-    if TOKEN:
-        token_mask = TOKEN[:4] + "..." + TOKEN[-4:]
+    if BOT_TOKENS:
+        first = BOT_TOKENS[0]
+        token_mask = first[:4] + "..." + first[-4:]
+        if len(BOT_TOKENS) > 1:
+            token_mask = f"{token_mask} (+{len(BOT_TOKENS)-1})"
     crypto_mask = "нет"
     if CRYPTOBOT_TOKEN:
         crypto_mask = CRYPTOBOT_TOKEN[:4] + "..." + CRYPTOBOT_TOKEN[-4:]
@@ -7638,7 +7863,19 @@ def render_profile_text(user) -> str:
     allow_broadcast = "Вкл" if settings.get("allow_broadcast", 1) else "Выкл"
     points = db.get_points_profile(user.id) if is_points_enabled() else {"balance": 0, "total_earned": 0, "total_redeemed": 0}
     ref_stats = db.get_referral_stats(user.id) if is_referral_enabled() else {"total": 0, "active": 0}
-    ref_link = build_referral_link(user.id) if is_referral_enabled() else ""
+    bot_idx = 0
+    key = current_bot_key()
+    if key.startswith("bot") and key[3:].isdigit():
+        bot_idx = max(0, int(key[3:]) - 1)
+    ref_link = build_referral_link(user.id, bot_idx) if is_referral_enabled() else ""
+    extra_links: List[Tuple[int, str]] = []
+    if is_referral_enabled() and len(BOT_TOKENS) > 1:
+        for idx in range(len(BOT_TOKENS)):
+            if idx == bot_idx:
+                continue
+            link = build_referral_link(user.id, idx)
+            if link:
+                extra_links.append((idx + 1, link))
     uname = human_name(user)
     points_block = ""
     if is_points_enabled():
@@ -7652,7 +7889,13 @@ def render_profile_text(user) -> str:
         )
     referral_block = ""
     if is_referral_enabled():
-        link_line = f"\n<code>{html.escape(ref_link)}</code>" if ref_link else "\n<i>Ссылка станет доступна после запуска бота.</i>"
+        if ref_link:
+            lines_links = [f"<code>{html.escape(ref_link)}</code>"]
+            for bot_num, link in extra_links:
+                lines_links.append(f"<i>бот{bot_num}</i> <code>{html.escape(link)}</code>")
+            link_line = "\n" + "\n".join(lines_links)
+        else:
+            link_line = "\n<i>Ссылка станет доступна после запуска бота.</i>"
         referral_block = (
             "━━━━━━━━━━━━━━━━\n"
             "<b>🔗 Рефералы</b>\n"
@@ -7762,41 +8005,67 @@ async def start_render_server() -> asyncio.AbstractServer:
         port = 10000
     return await asyncio.start_server(_render_http_handler, host="0.0.0.0", port=port)
 
-async def cleanup_task(bot: Bot):
-    last_log_ts = 0.0
-    while not SHUTDOWN_EVENT.is_set():
-        await asyncio.sleep(10)
-        if now_ts() - last_log_ts > 60:
-            log_message("Очистка просроченных платежей и лобби...")
-            last_log_ts = now_ts()
-        now = now_ts()
-        for user_id, payment in list(awaiting_payment.items()):
-            if now - payment.get("start_time", 0) > PAYMENT_TIMEOUT:
-                lobby = lobbies.get_lobby_by_player(user_id)
-                if lobby:
-                    db.refund_payment(lobby.match_id or lobby.lobby_id, user_id)
-                    await bot.send_message(user_id, "\u23f0 Время оплаты истекло. Ставка возвращена.")
-                awaiting_payment.pop(user_id, None)
-        await lobbies.cleanup_stale(bot)
-        await check_betting_afk(bot)
-        await process_broadcasts(bot)
+async def cleanup_task(bot: Bot, bot_key: str = "bot1"):
+    token = CURRENT_BOT_KEY.set(bot_key)
+    try:
+        last_log_ts = 0.0
+        while not SHUTDOWN_EVENT.is_set():
+            await asyncio.sleep(10)
+            if now_ts() - last_log_ts > 60:
+                log_message("Очистка просроченных платежей и лобби...")
+                last_log_ts = now_ts()
+            now = now_ts()
+            for user_id, payment in list(awaiting_payment.items()):
+                if now - payment.get("start_time", 0) > PAYMENT_TIMEOUT:
+                    lobby = lobbies.get_lobby_by_player(user_id)
+                    if lobby:
+                        db.refund_payment(lobby.match_id or lobby.lobby_id, user_id)
+                        await bot.send_message(user_id, "\u23f0 Время оплаты истекло. Ставка возвращена.")
+                    awaiting_payment.pop(user_id, None)
+            await lobbies.cleanup_stale(bot)
+            await check_betting_afk(bot)
+            await process_broadcasts(bot)
+    finally:
+        CURRENT_BOT_KEY.reset(token)
 
 async def main():
     db._init_db()
     check_db_connection()
     if not validate_config():
         return
-    bot = Bot(token=TOKEN)
-    global BOT_USERNAME
-    try:
-        me = await bot.get_me()
-        BOT_USERNAME = getattr(me, "username", "") or BOT_USERNAME
-    except Exception:
-        pass
+    if not BOT_TOKENS:
+        log_message("ОШИБКА: список токенов пуст. Бот не запущен.")
+        return
+    bots: List[Bot] = []
+    global BOT_USERNAME, BOT_USERNAMES
+    for t in BOT_TOKENS:
+        try:
+            bots.append(Bot(token=t))
+        except Exception as e:
+            log_message(f"Ошибка инициализации бота: {e}")
+    if not bots:
+        log_message("ОШИБКА: не удалось создать инстансы бота.")
+        return
+    BOT_USERNAMES = []
+    BOT_ID_MAP.clear()
+    for idx, b in enumerate(bots):
+        try:
+            me = await b.get_me()
+            uname = getattr(me, "username", "") or ""
+            if uname.startswith("@"):
+                uname = uname[1:]
+            BOT_USERNAMES.append(uname)
+            BOT_ID_MAP[me.id] = f"bot{idx+1}"
+        except Exception:
+            BOT_USERNAMES.append("")
+    if BOT_USERNAMES:
+        BOT_USERNAME = BOT_USERNAMES[0] or BOT_USERNAME
     dp = Dispatcher()
+    dp.update.middleware(BotContextMiddleware())
     dp.include_router(router)
     server = await start_render_server()
-    asyncio.create_task(cleanup_task(bot))
+    for idx, b in enumerate(bots):
+        asyncio.create_task(cleanup_task(b, f"bot{idx+1}"))
     log_message("Бот запущен")
     status_icon = "\u2705" if cryptobot.enabled else "\u274c"
     log_message(f"CryptoBot: {status_icon}")
@@ -7814,7 +8083,7 @@ async def main():
             pass
         while not SHUTDOWN_EVENT.is_set():
             try:
-                await dp.start_polling(bot)
+                await dp.start_polling(*bots)
                 if not SHUTDOWN_EVENT.is_set():
                     log_message("Polling завершился. Перезапуск через 3 секунды.")
                     await asyncio.sleep(3)
@@ -7826,7 +8095,11 @@ async def main():
         server.close()
         await server.wait_closed()
         await cryptobot.close()
-        await bot.session.close()
+        for b in bots:
+            try:
+                await b.session.close()
+            except Exception:
+                pass
         log_message("Бот остановлен")
 
 if __name__ == "__main__":
