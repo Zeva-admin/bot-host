@@ -29,6 +29,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BufferedInputFile,
+    LabeledPrice,
+    PreCheckoutQuery,
 )
 from aiogram.exceptions import TelegramBadRequest
 import resvg_py
@@ -4295,6 +4297,7 @@ def kb_support_donate_currency() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="USD (доллар)", callback_data=f"{CB.SUPPORT_DONATE_CUR}usd"),
                 InlineKeyboardButton(text="RUB (рубли)", callback_data=f"{CB.SUPPORT_DONATE_CUR}rub"),
             ],
+            [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"{CB.SUPPORT_DONATE_CUR}stars")],
             [InlineKeyboardButton(text="Назад", callback_data=CB.SUPPORT_DONATE_CANCEL)],
         ]
     )
@@ -5111,7 +5114,7 @@ async def cb_menu_support_donate(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
-    if not is_support_donations_enabled() or not cryptobot.enabled:
+    if not is_support_donations_enabled():
         await safe_edit_text(
             bot,
             call.message.chat.id,
@@ -5145,7 +5148,7 @@ async def cb_support_donate_cur(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     if not await ensure_subscribed_for_call(call, bot):
         return
-    if not is_support_donations_enabled() or not cryptobot.enabled:
+    if not is_support_donations_enabled():
         await safe_edit_text(
             bot,
             call.message.chat.id,
@@ -5155,12 +5158,23 @@ async def cb_support_donate_cur(call: CallbackQuery, bot: Bot):
         )
         return
     cur = call.data[len(CB.SUPPORT_DONATE_CUR):].strip().lower()
-    if cur not in ("usd", "rub"):
+    if cur not in ("usd", "rub", "stars"):
         cur = "usd"
+    if cur in ("usd", "rub") and not cryptobot.enabled:
+        await safe_edit_text(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            "Оплата в USDT временно недоступна. Выберите Telegram Stars.",
+            kb_support_donate_currency(),
+        )
+        return
     awaiting_support_donation[call.from_user.id] = {"currency": cur}
     rate = get_support_rub_rate()
     if cur == "rub":
         prompt = f"Введите сумму в рублях.\nКурс: 1 USD = {rate:g} RUB"
+    elif cur == "stars":
+        prompt = "Введите количество Stars (целое число)."
     else:
         prompt = "Введите сумму в долларах (USD)."
     await safe_edit_text(
@@ -5177,6 +5191,45 @@ async def cb_support_donate_cancel(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
     awaiting_support_donation.pop(call.from_user.id, None)
     await show_menu(bot, call.message.chat.id, call.from_user, call.message)
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery, bot: Bot):
+    try:
+        await bot.answer_pre_checkout_query(query.id, ok=True)
+    except Exception:
+        pass
+
+
+@router.message(F.successful_payment)
+async def msg_successful_payment(message: Message, bot: Bot):
+    sp = message.successful_payment
+    if not sp:
+        return
+    payload = (sp.invoice_payload or "").strip()
+    if not payload.startswith("support_stars:"):
+        return
+    uid = message.from_user.id if message.from_user else 0
+    awaiting_support_donation_payment.pop(uid, None)
+    stars_paid = int(sp.total_amount or 0)
+    if stars_paid <= 0:
+        try:
+            parts = payload.split(":")
+            stars_paid = int(parts[2]) if len(parts) > 2 else 0
+        except Exception:
+            stars_paid = 0
+    await message.answer(
+        f"✅ Спасибо за поддержку! Платёж на {stars_paid} ⭐ получен."
+        if stars_paid > 0 else "✅ Спасибо за поддержку! Платёж получен."
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⭐ Поддержка Stars: {stars_paid} ⭐ (user {uid})" if stars_paid > 0 else f"⭐ Поддержка Stars (user {uid})",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data == CB.PROFILE_TOGGLE_PHOTO)
@@ -7125,12 +7178,61 @@ async def msg_any(message: Message, bot: Bot):
                 pass
         return
     if uid in awaiting_support_donation:
-        if not is_support_donations_enabled() or not cryptobot.enabled:
+        if not is_support_donations_enabled():
             awaiting_support_donation.pop(uid, None)
             await message.answer("Поддержка бота сейчас недоступна.")
             return
         state = awaiting_support_donation.get(uid, {})
         cur = state.get("currency", "usd")
+        if cur == "stars":
+            raw = text.replace(" ", "")
+            if not raw.isdigit():
+                await message.answer("Введите количество Stars целым числом (например 50).")
+                return
+            stars = int(raw)
+            if stars <= 0:
+                await message.answer("Введите количество Stars больше 0.")
+                return
+            if uid in awaiting_support_donation_payment:
+                data = awaiting_support_donation_payment.get(uid, {})
+                created_at = float(data.get("created_at") or 0.0)
+                if data.get("invoice_url"):
+                    await message.answer("У вас уже есть активный счёт. Дождитесь оплаты или таймаута.")
+                    return
+                if now_ts() - created_at < 600:
+                    await message.answer("У вас уже есть активный счёт Stars. Дождитесь оплаты или попробуйте позже.")
+                    return
+                awaiting_support_donation_payment.pop(uid, None)
+            awaiting_support_donation.pop(uid, None)
+            payload = f"support_stars:{uid}:{stars}:{int(now_ts())}"
+            prices = [LabeledPrice(label=f"Поддержка бота ({stars} ⭐)", amount=stars)]
+            try:
+                await bot.send_invoice(
+                    chat_id=message.chat.id,
+                    title="Поддержка бота",
+                    description="Поддержка проекта Telegram Stars",
+                    payload=payload,
+                    provider_token="",
+                    currency="XTR",
+                    prices=prices,
+                    start_parameter="support-stars",
+                )
+            except Exception as e:
+                log_message(f"Ошибка создания счёта Stars: {e}")
+                await message.answer("Не удалось создать счёт Stars. Попробуйте позже.")
+                return
+            awaiting_support_donation_payment[uid] = {
+                "type": "stars",
+                "amount": stars,
+                "payload": payload,
+                "created_at": now_ts(),
+            }
+            await message.answer("Счёт Stars создан. Оплатите его в появившемся сообщении.")
+            return
+        if cur in ("usd", "rub") and not cryptobot.enabled:
+            awaiting_support_donation.pop(uid, None)
+            await message.answer("Оплата в USDT временно недоступна. Выберите Telegram Stars.")
+            return
         raw = text.replace(" ", "").replace(",", ".")
         try:
             amount = Decimal(raw)
