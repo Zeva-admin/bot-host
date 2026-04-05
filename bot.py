@@ -7868,14 +7868,6 @@ def render_profile_text(user) -> str:
     if key.startswith("bot") and key[3:].isdigit():
         bot_idx = max(0, int(key[3:]) - 1)
     ref_link = build_referral_link(user.id, bot_idx) if is_referral_enabled() else ""
-    extra_links: List[Tuple[int, str]] = []
-    if is_referral_enabled() and len(BOT_TOKENS) > 1:
-        for idx in range(len(BOT_TOKENS)):
-            if idx == bot_idx:
-                continue
-            link = build_referral_link(user.id, idx)
-            if link:
-                extra_links.append((idx + 1, link))
     uname = human_name(user)
     points_block = ""
     if is_points_enabled():
@@ -7890,10 +7882,7 @@ def render_profile_text(user) -> str:
     referral_block = ""
     if is_referral_enabled():
         if ref_link:
-            lines_links = [f"<code>{html.escape(ref_link)}</code>"]
-            for bot_num, link in extra_links:
-                lines_links.append(f"<i>бот{bot_num}</i> <code>{html.escape(link)}</code>")
-            link_line = "\n" + "\n".join(lines_links)
+            link_line = f"\n<code>{html.escape(ref_link)}</code>"
         else:
             link_line = "\n<i>Ссылка станет доступна после запуска бота.</i>"
         referral_block = (
