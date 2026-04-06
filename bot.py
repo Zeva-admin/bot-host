@@ -14,6 +14,7 @@ import platform
 import sys
 import signal
 import contextvars
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -40,9 +41,6 @@ try:
 except Exception:
     Groq = None
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger(__name__)
-
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
@@ -59,12 +57,29 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres.jqiomtvtvts
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "-1003691561522").strip()
 REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
 NEWS_CHANNEL_URL = os.environ.get("NEWS_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
+BOT_TOKENS_ENV = os.environ.get("BOT_TOKENS", "").strip()
+BOT_TOKENS_FILE = os.environ.get("BOT_TOKENS_FILE", "").strip()
+ERROR_LOG_PATH = os.environ.get("ERROR_LOG_PATH", "").strip()
+PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "1"))
+PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "5"))
+SUBSCRIPTION_CHECK_TIMEOUT = float(os.environ.get("SUBSCRIPTION_CHECK_TIMEOUT", "3.0"))
 LOBBY_IDLE_TIMEOUT = 300  # 5 минут
 AFK_PROMPT_DELAY = 120    # 2 минуты без хода
 AFK_PROMPT_WINDOW = 60    # окно подтверждения (до 3-й минуты)
 AFK_FORFEIT_DELAY = 180   # 3 минуты без хода
 
 AFK_MAX_PROMPTS = 2
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+if ERROR_LOG_PATH:
+    try:
+        err_handler = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
+        err_handler.setLevel(logging.ERROR)
+        err_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(err_handler)
+    except Exception:
+        pass
 
 # Ставки в USD (фиксированные)
 STAKE_AMOUNTS = {
@@ -130,14 +145,49 @@ def log_message(message: str):
     logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
 
+def log_error(message: str, exc: Optional[BaseException] = None):
+    prefix = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    if exc is not None:
+        logger.exception(prefix, exc_info=exc)
+    else:
+        logger.error(prefix)
+
+
+def install_asyncio_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
+    def _handler(loop: asyncio.AbstractEventLoop, context: dict):
+        msg = context.get("message") or "Unhandled asyncio exception"
+        exc = context.get("exception")
+        if exc:
+            logger.exception(msg, exc_info=exc)
+        else:
+            logger.error(msg)
+    try:
+        loop.set_exception_handler(_handler)
+    except Exception:
+        pass
+
+
 def _split_tokens(raw: str) -> List[str]:
     if not raw:
         return []
-    parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
+    cleaned = raw.replace("\n", ",").replace(";", ",")
+    parts = [p.strip() for p in cleaned.split(",")]
     return [p for p in parts if p]
 
 
-BOT_TOKENS = _split_tokens(TOKEN)
+def _load_tokens() -> List[str]:
+    raw = BOT_TOKENS_ENV or TOKEN
+    if BOT_TOKENS_FILE:
+        try:
+            path = Path(BOT_TOKENS_FILE)
+            if path.exists():
+                raw = path.read_text(encoding="utf-8")
+        except Exception as e:
+            log_error(f"Не удалось прочитать BOT_TOKENS_FILE: {BOT_TOKENS_FILE}", e)
+    return _split_tokens(raw)
+
+
+BOT_TOKENS = _load_tokens()
 
 # Текущий бот (для разделения состояния и БД)
 CURRENT_BOT_KEY = contextvars.ContextVar("CURRENT_BOT_KEY", default="bot1")
@@ -239,6 +289,68 @@ class BotScopedDict:
     def setdefault(self, key, default=None):
         return self._dict().setdefault(key, default)
 
+
+class BotScopedTTLCache:
+    def __init__(self, default_ttl: float = 60.0):
+        self._data: Dict[str, Dict] = {}
+        self._default_ttl = float(default_ttl)
+
+    def _dict(self) -> Dict:
+        key = current_bot_key()
+        if key not in self._data:
+            self._data[key] = {}
+        return self._data[key]
+
+    def _expiry(self, ttl: Optional[float]) -> float:
+        if ttl is None:
+            ttl = self._default_ttl
+        ttl = float(ttl)
+        if ttl <= 0:
+            return 0.0
+        return now_ts() + ttl
+
+    def set(self, key, value, ttl: Optional[float] = None):
+        self._dict()[key] = (self._expiry(ttl), value)
+
+    def get(self, key, default=None):
+        item = self._dict().get(key)
+        if not item:
+            return default
+        exp, value = item
+        if exp and now_ts() > exp:
+            self._dict().pop(key, None)
+            return default
+        return value
+
+    def has(self, key) -> bool:
+        item = self._dict().get(key)
+        if not item:
+            return False
+        exp, _ = item
+        if exp and now_ts() > exp:
+            self._dict().pop(key, None)
+            return False
+        return True
+
+    def pop(self, key, default=None):
+        item = self._dict().pop(key, None)
+        if not item:
+            return default
+        exp, value = item
+        if exp and now_ts() > exp:
+            return default
+        return value
+
+    def clear(self):
+        self._dict().clear()
+
+    def cleanup(self):
+        now = now_ts()
+        data = self._dict()
+        expired = [k for k, (exp, _) in data.items() if exp and now > exp]
+        for k in expired:
+            data.pop(k, None)
+
     def clear(self):
         self._dict().clear()
 
@@ -268,12 +380,36 @@ class BotScopedObject:
 
 
 START_TS = now_ts()
-SUBSCRIPTION_CACHE: BotScopedDict = BotScopedDict()
 SUBSCRIPTION_TTL = 300.0
-NOTICE_CACHE: BotScopedDict = BotScopedDict(default_factory=lambda: {"ts": 0.0, "text": None})
-USER_SETTINGS_CACHE: BotScopedDict = BotScopedDict()
+SUBSCRIPTION_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=SUBSCRIPTION_TTL)
+NOTICE_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=60.0)
 USER_SETTINGS_TTL = 300.0
+USER_SETTINGS_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=USER_SETTINGS_TTL)
 SHUTDOWN_EVENT = asyncio.Event()
+BG_WORKERS = int(os.environ.get("BG_WORKERS", "2"))
+BACKGROUND_QUEUE: asyncio.Queue = asyncio.Queue()
+
+
+async def enqueue_background(coro):
+    key = current_bot_key()
+    async def _runner():
+        token = CURRENT_BOT_KEY.set(key)
+        try:
+            await coro
+        finally:
+            CURRENT_BOT_KEY.reset(token)
+    await BACKGROUND_QUEUE.put(_runner())
+
+
+async def background_worker(worker_id: int):
+    while not SHUTDOWN_EVENT.is_set():
+        coro = await BACKGROUND_QUEUE.get()
+        try:
+            await coro
+        except Exception as e:
+            log_error(f"Ошибка background worker #{worker_id}", e)
+        finally:
+            BACKGROUND_QUEUE.task_done()
 
 
 def extract_start_arg(text: Optional[str]) -> str:
@@ -349,6 +485,8 @@ class Database:
         self.db_kind = "postgres" if self.db_url else "sqlite"
         self.schema = schema
         self._schema_ready = False
+        self._pool = None
+        self._pool_lock = threading.Lock()
         self._kv_cache: Dict[str, str] = {}
         self._kv_cache_ts = 0.0
         self._kv_cache_ttl = 30.0
@@ -356,12 +494,52 @@ class Database:
             self._ensure_schema()
         self._init_db()
         log_message("База данных инициализирована")
-    
-    def _get_connection(self):
-        if self.db_kind == "postgres":
+
+    class _PooledConn:
+        def __init__(self, pool, conn):
+            self._pool = pool
+            self._conn = conn
+
+        def cursor(self, *args, **kwargs):
+            return self._conn.cursor(*args, **kwargs)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def rollback(self):
+            return self._conn.rollback()
+
+        def close(self):
+            if self._conn is None:
+                return
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _get_pg_pool(self):
+        if self._pool is not None:
+            return self._pool
+        with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
             try:
                 import psycopg2
                 import psycopg2.extras
+                from psycopg2.pool import ThreadedConnectionPool
             except Exception as e:
                 raise RuntimeError("psycopg2 is required for PostgreSQL") from e
             class AdaptCursor(psycopg2.extras.DictCursor):
@@ -371,14 +549,21 @@ class Database:
             conn_kwargs = {"cursor_factory": AdaptCursor}
             if self.db_url and "sslmode=" not in self.db_url:
                 conn_kwargs["sslmode"] = "require"
-            conn = psycopg2.connect(self.db_url, **conn_kwargs)
+            self._pool = ThreadedConnectionPool(PG_POOL_MIN, PG_POOL_MAX, self.db_url, **conn_kwargs)
+            return self._pool
+    
+    def _get_connection(self):
+        if self.db_kind == "postgres":
+            pool = self._get_pg_pool()
+            conn = pool.getconn()
             if self.schema:
                 try:
                     cur = conn.cursor()
                     cur.execute(f'SET search_path TO "{self.schema}"')
+                    cur.close()
                 except Exception:
                     pass
-            return conn
+            return Database._PooledConn(pool, conn)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
@@ -2226,13 +2411,13 @@ class CryptoBotClient:
                     return result.get("result", {})
                 else:
                     error = result.get("error", "Unknown error")
-                    log_message(f"CryptoBot API error: {error}")
+                    log_error(f"CryptoBot API error: {error}")
                     raise Exception(f"{error} (status: {response.status})")
         except aiohttp.ClientError as e:
-            log_message(f"CryptoBot network error: {e}")
+            log_error("CryptoBot network error", e)
             raise
         except Exception as e:
-            log_message(f"CryptoBot request error: {e}")
+            log_error("CryptoBot request error", e)
             raise
     
     async def create_invoice(self, amount: float, asset: str = "USDT",
@@ -2284,6 +2469,27 @@ class CryptoBotClient:
         return await self._request("createCheck", data)
 
 cryptobot = CryptoBotClient(CRYPTOBOT_TOKEN)
+
+
+async def safe_create_invoice(amount: float, asset: str, description: str, expires_in: int = 900, retries: int = 3) -> Tuple[Optional[dict], Optional[str]]:
+    last_err: Optional[Exception] = None
+    last_err_text: Optional[str] = None
+    for attempt in range(max(1, retries)):
+        try:
+            return await cryptobot.create_invoice(
+                amount=amount,
+                asset=asset,
+                description=description,
+                expires_in=expires_in,
+            ), None
+        except Exception as e:
+            last_err = e
+            last_err_text = str(e)
+            log_error("Ошибка создания инвойса CryptoBot", e)
+            await asyncio.sleep(1 + attempt * 2)
+    if last_err:
+        log_error("Не удалось создать инвойс CryptoBot", last_err)
+    return None, last_err_text
 
 # =============================================================================
 # КАРТЫ / МОДЕЛИ
@@ -3672,19 +3878,21 @@ async def is_user_subscribed(
         return True
     if not is_subscription_required():
         return True
-    cached_ts = SUBSCRIPTION_CACHE.get(user_id, 0.0)
-    if not force and now_ts() - cached_ts < SUBSCRIPTION_TTL:
+    if not force and SUBSCRIPTION_CACHE.get(user_id):
         return True
     had_error = False
     attempts = max(0, int(retries)) + 1
     for attempt in range(attempts):
         for chat_id in _channel_candidates():
             try:
-                member = await bot.get_chat_member(chat_id, user_id)
+                member = await asyncio.wait_for(
+                    bot.get_chat_member(chat_id, user_id),
+                    timeout=SUBSCRIPTION_CHECK_TIMEOUT,
+                )
                 status = getattr(member, "status", "")
                 is_member = getattr(member, "is_member", False)
                 if status in ("creator", "administrator", "member", "restricted") or is_member:
-                    SUBSCRIPTION_CACHE[user_id] = now_ts()
+                    SUBSCRIPTION_CACHE.set(user_id, True)
                     return True
             except Exception:
                 had_error = True
@@ -3692,7 +3900,7 @@ async def is_user_subscribed(
         if attempt < attempts - 1:
             await asyncio.sleep(max(0.2, float(delay)))
     if allow_on_error and had_error:
-        SUBSCRIPTION_CACHE[user_id] = now_ts()
+        SUBSCRIPTION_CACHE.set(user_id, True)
         return True
     return False
 
@@ -3748,32 +3956,59 @@ async def ensure_subscribed_for_call(call: CallbackQuery, bot: Bot) -> bool:
 
 
 def get_cached_notice_text() -> Optional[str]:
-    now = now_ts()
-    if now - float(NOTICE_CACHE.get("ts") or 0) < 60:
+    if NOTICE_CACHE.has("text"):
         return NOTICE_CACHE.get("text")
     try:
-        active_notice = db.get_active_broadcast(now)
+        active_notice = db.get_active_broadcast(now_ts())
         text = active_notice.get("text") if active_notice else None
     except Exception:
         text = None
-    NOTICE_CACHE["ts"] = now
-    NOTICE_CACHE["text"] = text
+    NOTICE_CACHE.set("text", text, ttl=60.0)
     return text
+
+
+def get_cached_notice_text_fast() -> Optional[str]:
+    if NOTICE_CACHE.has("text"):
+        return NOTICE_CACHE.get("text")
+    return None
 
 
 def get_cached_user_settings(user_id: int) -> dict:
     cached = USER_SETTINGS_CACHE.get(user_id)
     if cached:
-        ts, data = cached
-        if now_ts() - ts < USER_SETTINGS_TTL:
-            return data
+        return cached
     data = db.get_user_settings(user_id)
-    USER_SETTINGS_CACHE[user_id] = (now_ts(), data)
+    USER_SETTINGS_CACHE.set(user_id, data, ttl=USER_SETTINGS_TTL)
     return data
 
 
 def update_cached_user_settings(user_id: int, data: dict) -> None:
-    USER_SETTINGS_CACHE[user_id] = (now_ts(), data)
+    USER_SETTINGS_CACHE.set(user_id, data, ttl=USER_SETTINGS_TTL)
+
+
+def get_cached_user_settings_fast(user_id: int) -> dict:
+    cached = USER_SETTINGS_CACHE.get(user_id)
+    if cached:
+        return cached
+    return {"user_id": user_id, "show_card_photos": 1, "allow_broadcast": 1}
+
+
+async def refresh_user_settings_cache(user_id: int) -> None:
+    try:
+        data = db.get_user_settings(user_id)
+        USER_SETTINGS_CACHE.set(user_id, data, ttl=USER_SETTINGS_TTL)
+    except Exception as e:
+        log_error("Ошибка обновления кеша настроек пользователя", e)
+
+
+async def refresh_notice_cache() -> None:
+    try:
+        active_notice = db.get_active_broadcast(now_ts())
+        text = active_notice.get("text") if active_notice else None
+    except Exception as e:
+        log_error("Ошибка обновления кеша уведомления", e)
+        text = None
+    NOTICE_CACHE.set("text", text, ttl=60.0)
 
 
 def build_player(user) -> Player:
@@ -4840,15 +5075,14 @@ async def send_betting_invoice(bot: Bot, lobby: Lobby, player: Player):
             return
     if player.user_id in awaiting_payment:
         return
-    try:
-        invoice = await cryptobot.create_invoice(
-            amount=lobby.stake_amount,
-            asset="USDT",
-            description=f"Ставка ${lobby.stake_amount}",
-            expires_in=PAYMENT_TIMEOUT,
-        )
-    except Exception as e:
-        log_message(f"Ошибка создания счета: {e}")
+    invoice, _ = await safe_create_invoice(
+        amount=lobby.stake_amount,
+        asset="USDT",
+        description=f"Ставка ${lobby.stake_amount}",
+        expires_in=PAYMENT_TIMEOUT,
+        retries=3,
+    )
+    if not invoice:
         await bot.send_message(player.user_id, "Ой, что-то пошло не так.")
         return
     invoice_id = int(invoice.get("invoice_id", 0))
@@ -4977,6 +5211,9 @@ async def prepare_betting_match(bot: Bot, lobby: Lobby):
 async def show_menu(bot: Bot, chat_id: int, user, message: Message = None):
     if not await ensure_subscribed(bot, chat_id, user):
         return
+    if user:
+        await enqueue_background(refresh_user_settings_cache(user.id))
+        await enqueue_background(refresh_notice_cache())
     text = render_main_menu_text(user)
     if message:
         try:
@@ -6306,8 +6543,7 @@ async def cb_admin_cleanup_full_confirm(call: CallbackQuery, bot: Bot):
         return
     ok = db.reset_all_data()
     SUBSCRIPTION_CACHE.clear()
-    NOTICE_CACHE["ts"] = 0.0
-    NOTICE_CACHE["text"] = None
+    NOTICE_CACHE.clear()
     USER_SETTINGS_CACHE.clear()
     text = "База очищена и пересоздана." if ok else "Не удалось очистить БД."
     await safe_edit_text(
@@ -7266,23 +7502,15 @@ async def msg_any(message: Message, bot: Bot):
             await message.answer("Сумма слишком маленькая. Увеличьте и попробуйте ещё раз.")
             return
         awaiting_support_donation.pop(uid, None)
-        invoice = None
-        last_err = None
-        for attempt in range(3):
-            try:
-                invoice = await cryptobot.create_invoice(
-                    amount=float(usd_amount),
-                    asset="USDT",
-                    description=f"Поддержка бота ({display_amount})",
-                    expires_in=PAYMENT_TIMEOUT,
-                )
-                break
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(1 + attempt * 2)
+        invoice, err_text = await safe_create_invoice(
+            amount=float(usd_amount),
+            asset="USDT",
+            description=f"Поддержка бота ({display_amount})",
+            expires_in=PAYMENT_TIMEOUT,
+            retries=3,
+        )
         if not invoice:
-            msg = str(last_err or "").lower()
-            log_message(f"Ошибка создания счёта поддержки: {last_err}")
+            msg = (err_text or "").lower()
             if "min" in msg or "minimum" in msg or "amount" in msg or "small" in msg:
                 await message.answer(
                     "CryptoBot не принимает такую сумму. Укажите сумму больше и попробуйте ещё раз."
@@ -7942,9 +8170,9 @@ def render_main_menu_text(user=None, compact: bool = False) -> str:
     lines.append("Нужна помощь? Загляни в «Правила».")
     show_notice = is_broadcasts_enabled()
     if user:
-        settings = get_cached_user_settings(user.id)
+        settings = get_cached_user_settings_fast(user.id)
         show_notice = show_notice and bool(settings.get("allow_broadcast", 1))
-    notice_text_raw = get_cached_notice_text() if show_notice else None
+    notice_text_raw = get_cached_notice_text_fast() if show_notice else None
     if notice_text_raw:
         notice_text = html.escape(notice_text_raw)
         lines.append(" ")
@@ -8113,13 +8341,18 @@ async def cleanup_task(bot: Bot, bot_key: str = "bot1"):
                         db.refund_payment(lobby.match_id or lobby.lobby_id, user_id)
                         await bot.send_message(user_id, "\u23f0 Время оплаты истекло. Ставка возвращена.")
                     awaiting_payment.pop(user_id, None)
+            SUBSCRIPTION_CACHE.cleanup()
+            USER_SETTINGS_CACHE.cleanup()
+            NOTICE_CACHE.cleanup()
             await lobbies.cleanup_stale(bot)
             await check_betting_afk(bot)
-            await process_broadcasts(bot)
+            await enqueue_background(process_broadcasts(bot))
     finally:
         CURRENT_BOT_KEY.reset(token)
 
 async def main():
+    loop = asyncio.get_running_loop()
+    install_asyncio_exception_handler(loop)
     db._init_db()
     check_db_connection()
     if not validate_config():
@@ -8149,6 +8382,8 @@ async def main():
             BOT_ID_MAP[me.id] = f"bot{idx+1}"
         except Exception:
             BOT_USERNAMES.append("")
+    for i in range(max(1, BG_WORKERS)):
+        asyncio.create_task(background_worker(i + 1))
     if BOT_USERNAMES:
         BOT_USERNAME = BOT_USERNAMES[0] or BOT_USERNAME
     dp = Dispatcher()
