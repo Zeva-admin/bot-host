@@ -215,6 +215,24 @@ class BotContextMiddleware(BaseMiddleware):
             CURRENT_BOT_KEY.reset(token)
 
 
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user") or getattr(event, "from_user", None)
+        if not user or getattr(user, "id", 0) <= 0:
+            return await handler(event, data)
+        now = now_ts()
+        last = float(RATE_LIMIT_CACHE.get(user.id, 0.0) or 0.0)
+        if now - last < RATE_LIMIT_SECONDS:
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
+            return
+        RATE_LIMIT_CACHE[user.id] = now
+        return await handler(event, data)
+
+
 class BotScopedSet:
     def __init__(self):
         self._data: Dict[str, Set] = {}
@@ -385,6 +403,8 @@ SUBSCRIPTION_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=SUBSCRIPTI
 NOTICE_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=60.0)
 USER_SETTINGS_TTL = 300.0
 USER_SETTINGS_CACHE: BotScopedTTLCache = BotScopedTTLCache(default_ttl=USER_SETTINGS_TTL)
+RATE_LIMIT_SECONDS = 1.0
+RATE_LIMIT_CACHE: BotScopedDict = BotScopedDict()
 SHUTDOWN_EVENT = asyncio.Event()
 BG_WORKERS = int(os.environ.get("BG_WORKERS", "2"))
 BACKGROUND_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -525,6 +545,16 @@ class Database:
             return self
 
         def __exit__(self, exc_type, exc, tb):
+            try:
+                if exc_type:
+                    self._conn.rollback()
+                else:
+                    self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
             self.close()
 
         def __getattr__(self, name):
@@ -551,6 +581,14 @@ class Database:
                 conn_kwargs["sslmode"] = "require"
             self._pool = ThreadedConnectionPool(PG_POOL_MIN, PG_POOL_MAX, self.db_url, **conn_kwargs)
             return self._pool
+
+    def close(self) -> None:
+        if self._pool is not None:
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
+            self._pool = None
     
     def _get_connection(self):
         if self.db_kind == "postgres":
@@ -597,9 +635,25 @@ class Database:
             return sql.replace("?", "%s")
         return sql
 
+    def _for_update(self, sql: str) -> str:
+        if self.db_kind == "postgres":
+            return f"{sql} FOR UPDATE"
+        return sql
+
     def _exec(self, cursor, sql: str, params: tuple = ()):
         cursor.execute(self._adapt_sql(sql), params)
         return cursor
+
+    def _row_get(self, row, key: str, idx: int):
+        if row is None:
+            return None
+        try:
+            return row[key]
+        except Exception:
+            try:
+                return row[idx]
+            except Exception:
+                return None
     
     def _init_db(self):
         conn = self._get_connection()
@@ -918,6 +972,10 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_events_user ON user_events(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_betting_matches_status ON betting_matches(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_betting_payments_status ON betting_payments(status)")
+        try:
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_betting_payouts_match_user ON betting_payouts(match_id, user_id)")
+        except Exception as e:
+            log_error("Ошибка создания уникального индекса выплат", e)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_broadcasts_status ON admin_broadcasts(status)")
@@ -1188,6 +1246,8 @@ class Database:
     # Новые методы для ставок
     def create_betting_match(self, match_id: str, lobby_id: str, stake: float,
                             player1: int, player2: int) -> bool:
+        if not match_id or not lobby_id or stake <= 0 or player1 <= 0 or player2 <= 0:
+            return False
         conn = self._get_connection()
         cursor = conn.cursor()
         info = STAKE_AMOUNTS.get(stake) or STAKE_AMOUNTS.get(round(stake, 2))
@@ -1214,218 +1274,303 @@ class Database:
             conn.close()
     
     def update_match_invoice(self, match_id: str, user_id: int, invoice_id: str) -> bool:
+        if not match_id or not invoice_id or user_id <= 0 or len(str(invoice_id)) > 256:
+            return False
         conn = self._get_connection()
-        cursor = conn.cursor()
         try:
-            cursor.execute(
-                "SELECT player1_id FROM betting_matches WHERE match_id = ?", (match_id,)
-            )
-            is_p1 = cursor.fetchone()
-            
-            if is_p1 and is_p1[0] == user_id:
-                cursor.execute(
-                    "UPDATE betting_matches SET crypto_invoice_id_p1 = ? WHERE match_id = ?",
-                    (invoice_id, match_id)
+            with conn:
+                cursor = conn.cursor()
+                self._exec(
+                    cursor,
+                    self._for_update(
+                        "SELECT player1_id, player2_id, crypto_invoice_id_p1, crypto_invoice_id_p2 "
+                        "FROM betting_matches WHERE match_id = ?"
+                    ),
+                    (match_id,),
                 )
-            else:
-                cursor.execute(
-                    "UPDATE betting_matches SET crypto_invoice_id_p2 = ? WHERE match_id = ?",
-                    (invoice_id, match_id)
-                )
-            conn.commit()
-            return True
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                p1 = self._row_get(row, "player1_id", 0)
+                p2 = self._row_get(row, "player2_id", 1)
+                inv1 = self._row_get(row, "crypto_invoice_id_p1", 2)
+                inv2 = self._row_get(row, "crypto_invoice_id_p2", 3)
+                if p1 == user_id:
+                    if inv1:
+                        return True
+                    self._exec(
+                        cursor,
+                        "UPDATE betting_matches SET crypto_invoice_id_p1 = ? WHERE match_id = ?",
+                        (invoice_id, match_id),
+                    )
+                    return True
+                if p2 == user_id:
+                    if inv2:
+                        return True
+                    self._exec(
+                        cursor,
+                        "UPDATE betting_matches SET crypto_invoice_id_p2 = ? WHERE match_id = ?",
+                        (invoice_id, match_id),
+                    )
+                    return True
+                return False
         except Exception as e:
-            log_message(f"Ошибка обновления инвойса: {e}")
-            conn.rollback()
+            log_error("Ошибка обновления инвойса", e)
             return False
         finally:
             conn.close()
     
     def create_payment_record(self, match_id: str, user_id: int,
                              invoice_id: str, amount: float) -> int:
+        if not match_id or not invoice_id or user_id <= 0 or amount <= 0 or len(str(invoice_id)) > 256:
+            return 0
         conn = self._get_connection()
-        cursor = conn.cursor()
         try:
-            if self.db_kind == "postgres":
+            with conn:
+                cursor = conn.cursor()
                 self._exec(
                     cursor,
-                    """
-                    INSERT INTO betting_payments (match_id, user_id, invoice_id, amount, status)
-                    VALUES (?, ?, ?, ?, 'pending') RETURNING id
-                    """,
-                    (match_id, user_id, invoice_id, amount),
+                    "SELECT id FROM betting_payments WHERE invoice_id = ?",
+                    (invoice_id,),
                 )
-                payment_id = cursor.fetchone()[0]
-            else:
-                cursor.execute("""
-                    INSERT INTO betting_payments (match_id, user_id, invoice_id, amount, status)
-                    VALUES (?, ?, ?, ?, 'pending')
-                """, (match_id, user_id, invoice_id, amount))
-                payment_id = cursor.lastrowid
-            conn.commit()
-            return payment_id
+                row = cursor.fetchone()
+                existing_id = self._row_get(row, "id", 0)
+                if existing_id:
+                    return int(existing_id)
+                if self.db_kind == "postgres":
+                    self._exec(
+                        cursor,
+                        """
+                        INSERT INTO betting_payments (match_id, user_id, invoice_id, amount, status)
+                        VALUES (?, ?, ?, ?, 'pending') RETURNING id
+                        """,
+                        (match_id, user_id, invoice_id, amount),
+                    )
+                    payment_id = cursor.fetchone()[0]
+                else:
+                    self._exec(
+                        cursor,
+                        """
+                        INSERT INTO betting_payments (match_id, user_id, invoice_id, amount, status)
+                        VALUES (?, ?, ?, ?, 'pending')
+                        """,
+                        (match_id, user_id, invoice_id, amount),
+                    )
+                    payment_id = cursor.lastrowid
+                return int(payment_id or 0)
         except Exception as e:
-            log_message(f"Ошибка создания платежа: {e}")
-            conn.rollback()
+            log_error("Ошибка создания платежа", e)
             return 0
         finally:
             conn.close()
     
     def confirm_payment(self, invoice_id: str, crypto_hash: str) -> Optional[dict]:
+        if not invoice_id or len(str(invoice_id)) > 256:
+            return None
         conn = self._get_connection()
-        cursor = conn.cursor()
         try:
-            cursor.execute("""
-                SELECT id, match_id, user_id, amount FROM betting_payments
-                WHERE invoice_id = ? AND status = 'pending'
-            """, (invoice_id,))
-            row = cursor.fetchone()
-            
-            if not row:
-                conn.close()
-                return None
-            
-            payment_id, match_id, user_id, amount = row
-            
-            cursor.execute("""
-                UPDATE betting_payments SET status = 'paid', paid_at = CURRENT_TIMESTAMP, crypto_hash = ?
-                WHERE id = ?
-            """, (crypto_hash, payment_id))
-            
-            cursor.execute(
-                "SELECT player1_id, player2_id, status FROM betting_matches WHERE match_id = ?",
-                (match_id,)
-            )
-            match = cursor.fetchone()
-            
-            if match:
-                cursor.execute(
-                    """
-                    SELECT COUNT(*) FROM betting_payments
-                    WHERE match_id = ? AND user_id = ? AND status = 'paid'
-                    """,
-                    (match_id, match[0]),
+            with conn:
+                cursor = conn.cursor()
+                self._exec(
+                    cursor,
+                    self._for_update(
+                        "SELECT id, match_id, user_id, amount, status FROM betting_payments WHERE invoice_id = ?"
+                    ),
+                    (invoice_id,),
                 )
-                p1_paid = cursor.fetchone()[0] > 0
-                
-                cursor.execute(
-                    """
-                    SELECT COUNT(*) FROM betting_payments
-                    WHERE match_id = ? AND user_id = ? AND status = 'paid'
-                    """,
-                    (match_id, match[1]),
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                payment_id = self._row_get(row, "id", 0)
+                match_id = self._row_get(row, "match_id", 1)
+                user_id = self._row_get(row, "user_id", 2)
+                amount = self._row_get(row, "amount", 3)
+                status = self._row_get(row, "status", 4)
+                if status != "pending":
+                    return None
+                if not match_id or not user_id or amount is None:
+                    return None
+                self._exec(
+                    cursor,
+                    "UPDATE betting_payments SET status = 'paid', paid_at = CURRENT_TIMESTAMP, crypto_hash = ? WHERE id = ?",
+                    (crypto_hash, payment_id),
                 )
-                p2_paid = cursor.fetchone()[0] > 0
-                
-                if p1_paid and p2_paid and match[2] == 'waiting_payment':
-                    cursor.execute(
-                        "UPDATE betting_matches SET status = 'ready_to_start' WHERE match_id = ?",
-                        (match_id,)
+                self._exec(
+                    cursor,
+                    self._for_update("SELECT player1_id, player2_id, status FROM betting_matches WHERE match_id = ?"),
+                    (match_id,),
+                )
+                match = cursor.fetchone()
+                if match:
+                    p1 = self._row_get(match, "player1_id", 0)
+                    p2 = self._row_get(match, "player2_id", 1)
+                    mstatus = self._row_get(match, "status", 2)
+                    self._exec(
+                        cursor,
+                        "SELECT COUNT(*) FROM betting_payments WHERE match_id = ? AND user_id = ? AND status = 'paid'",
+                        (match_id, p1),
                     )
-            
-            conn.commit()
-            
-            return {"user_id": user_id, "amount": amount, "match_id": match_id}
+                    p1_paid = cursor.fetchone()[0] > 0
+                    self._exec(
+                        cursor,
+                        "SELECT COUNT(*) FROM betting_payments WHERE match_id = ? AND user_id = ? AND status = 'paid'",
+                        (match_id, p2),
+                    )
+                    p2_paid = cursor.fetchone()[0] > 0
+                    if p1_paid and p2_paid and mstatus == "waiting_payment":
+                        self._exec(
+                            cursor,
+                            "UPDATE betting_matches SET status = 'ready_to_start' WHERE match_id = ?",
+                            (match_id,),
+                        )
+                return {"user_id": int(user_id), "amount": float(amount), "match_id": match_id}
         except Exception as e:
-            log_message(f"Ошибка подтверждения платежа: {e}")
-            conn.rollback()
+            log_error("Ошибка подтверждения платежа", e)
             return None
         finally:
             conn.close()
     
     def finish_match(self, match_id: str, winner_id: int) -> Optional[float]:
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("""
-                UPDATE betting_matches SET status = 'finished', winner_id = ?,
-                    finished_at = CURRENT_TIMESTAMP
-                WHERE match_id = ? AND status IN ('ready_to_start', 'playing')
-            """, (winner_id, match_id))
-            
-            if cursor.rowcount == 0:
-                conn.close()
-                return None
-            
-            cursor.execute("""
-                SELECT payout_amount, commission_amount, player1_id, player2_id
-                FROM betting_matches WHERE match_id = ?
-            """, (match_id,))
-            result = cursor.fetchone()
-            
-            if result:
-                payout, commission, p1, p2 = result
-                
-                cursor.execute("""
-                    UPDATE user_balances SET
-                        balance = balance + ?,
-                        total_won = total_won + ?
-                    WHERE user_id = ?
-                """, (payout, payout, winner_id))
-                
-                loser_id = p2 if winner_id == p1 else p1
-                cursor.execute("""
-                    UPDATE user_balances SET
-                        total_lost = total_lost + ?
-                    WHERE user_id = ?
-                """, (payout / 2, loser_id))
-                
-                conn.commit()
-                conn.close()
-                return payout
-            else:
-                conn.close()
-                return None
-        except Exception as e:
-            log_message(f"Ошибка завершения матча: {e}")
-            conn.rollback()
-            conn.close()
+        if not match_id or winner_id <= 0:
             return None
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                self._exec(
+                    cursor,
+                    self._for_update(
+                        "SELECT status, payout_amount, player1_id, player2_id FROM betting_matches WHERE match_id = ?"
+                    ),
+                    (match_id,),
+                )
+                result = cursor.fetchone()
+                if not result:
+                    return None
+                status = self._row_get(result, "status", 0)
+                payout = self._row_get(result, "payout_amount", 1)
+                p1 = self._row_get(result, "player1_id", 2)
+                p2 = self._row_get(result, "player2_id", 3)
+                if status == "finished":
+                    return None
+                if status not in ("ready_to_start", "playing"):
+                    return None
+                if payout is None or float(payout) <= 0:
+                    return None
+                self._exec(
+                    cursor,
+                    """
+                    UPDATE betting_matches SET status = 'finished', winner_id = ?, finished_at = CURRENT_TIMESTAMP
+                    WHERE match_id = ?
+                    """,
+                    (winner_id, match_id),
+                )
+                self._exec(
+                    cursor,
+                    """
+                    INSERT INTO user_balances (user_id, balance, total_won)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        balance = user_balances.balance + excluded.balance,
+                        total_won = user_balances.total_won + excluded.total_won,
+                        last_updated = CURRENT_TIMESTAMP
+                    """,
+                    (winner_id, payout, payout),
+                )
+                loser_id = p2 if winner_id == p1 else p1
+                if loser_id and loser_id > 0:
+                    self._exec(
+                        cursor,
+                        """
+                        INSERT INTO user_balances (user_id, total_lost)
+                        VALUES (?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            total_lost = user_balances.total_lost + excluded.total_lost,
+                            last_updated = CURRENT_TIMESTAMP
+                        """,
+                        (loser_id, float(payout) / 2),
+                    )
+                return float(payout)
+        except Exception as e:
+            log_error("Ошибка завершения матча", e)
+            return None
+        finally:
+            conn.close()
 
     def finish_match_no_winner(self, match_id: str) -> bool:
+        if not match_id:
+            return False
         conn = self._get_connection()
-        cursor = conn.cursor()
         try:
-            cursor.execute("""
-                UPDATE betting_matches
-                SET status = 'finished', winner_id = NULL, finished_at = CURRENT_TIMESTAMP
-                WHERE match_id = ? AND status IN ('ready_to_start', 'playing')
-            """, (match_id,))
-            conn.commit()
-            return cursor.rowcount > 0
+            with conn:
+                cursor = conn.cursor()
+                self._exec(
+                    cursor,
+                    self._for_update("SELECT status FROM betting_matches WHERE match_id = ?"),
+                    (match_id,),
+                )
+                row = cursor.fetchone()
+                status = self._row_get(row, "status", 0)
+                if status == "finished":
+                    return False
+                if status not in ("ready_to_start", "playing"):
+                    return False
+                self._exec(
+                    cursor,
+                    """
+                    UPDATE betting_matches
+                    SET status = 'finished', winner_id = NULL, finished_at = CURRENT_TIMESTAMP
+                    WHERE match_id = ?
+                    """,
+                    (match_id,),
+                )
+                return True
         except Exception as e:
-            log_message(f"Ошибка завершения матча без победителя: {e}")
-            conn.rollback()
+            log_error("Ошибка завершения матча без победителя", e)
             return False
         finally:
             conn.close()
     
     def create_payout_check(self, match_id: str, user_id: int,
                            amount: float, check_hash: str, check_url: str) -> int:
+        if not match_id or user_id <= 0 or amount <= 0:
+            return 0
         conn = self._get_connection()
-        cursor = conn.cursor()
         try:
-            if self.db_kind == "postgres":
+            with conn:
+                cursor = conn.cursor()
                 self._exec(
                     cursor,
-                    """
-                    INSERT INTO betting_payouts (match_id, user_id, amount, check_hash, check_url, status)
-                    VALUES (?, ?, ?, ?, ?, 'pending') RETURNING id
-                    """,
-                    (match_id, user_id, amount, check_hash, check_url),
+                    self._for_update("SELECT id FROM betting_payouts WHERE match_id = ? AND user_id = ?"),
+                    (match_id, user_id),
                 )
-                payout_id = cursor.fetchone()[0]
-            else:
-                cursor.execute("""
-                    INSERT INTO betting_payouts (match_id, user_id, amount, check_hash, check_url, status)
-                    VALUES (?, ?, ?, ?, ?, 'pending')
-                """, (match_id, user_id, amount, check_hash, check_url))
-                payout_id = cursor.lastrowid
-            conn.commit()
-            return payout_id
+                row = cursor.fetchone()
+                existing_id = self._row_get(row, "id", 0)
+                if existing_id:
+                    return int(existing_id)
+                if self.db_kind == "postgres":
+                    self._exec(
+                        cursor,
+                        """
+                        INSERT INTO betting_payouts (match_id, user_id, amount, check_hash, check_url, status)
+                        VALUES (?, ?, ?, ?, ?, 'pending') RETURNING id
+                        """,
+                        (match_id, user_id, amount, check_hash, check_url),
+                    )
+                    payout_id = cursor.fetchone()[0]
+                else:
+                    self._exec(
+                        cursor,
+                        """
+                        INSERT INTO betting_payouts (match_id, user_id, amount, check_hash, check_url, status)
+                        VALUES (?, ?, ?, ?, ?, 'pending')
+                        """,
+                        (match_id, user_id, amount, check_hash, check_url),
+                    )
+                    payout_id = cursor.lastrowid
+                return int(payout_id or 0)
         except Exception as e:
-            log_message(f"Ошибка создания выплаты: {e}")
-            conn.rollback()
+            log_error("Ошибка создания выплаты", e)
             return 0
         finally:
             conn.close()
@@ -2363,6 +2508,14 @@ class DatabaseManager:
         self._dbs[key] = db
         return db
 
+    def close_all(self) -> None:
+        for db in list(self._dbs.values()):
+            try:
+                db.close()
+            except Exception:
+                pass
+        self._dbs.clear()
+
 
 class DBProxy:
     def __init__(self, manager: DatabaseManager):
@@ -2373,6 +2526,9 @@ class DBProxy:
 
     def __getattr__(self, name):
         return getattr(self._db(), name)
+
+    def close_all(self) -> None:
+        self._manager.close_all()
 
 
 db = DBProxy(DatabaseManager())
@@ -2403,22 +2559,25 @@ class CryptoBotClient:
             "Content-Type": "application/json"
         }
         url = f"{self.base_url}/{method}"
-        
-        try:
-            async with session.post(url, json=data or {}, headers=headers, timeout=30) as response:
-                result = await response.json()
-                if result.get("ok"):
-                    return result.get("result", {})
-                else:
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                async with session.post(url, json=data or {}, headers=headers, timeout=30) as response:
+                    result = await response.json()
+                    if result.get("ok"):
+                        return result.get("result", {})
                     error = result.get("error", "Unknown error")
-                    log_error(f"CryptoBot API error: {error}")
                     raise Exception(f"{error} (status: {response.status})")
-        except aiohttp.ClientError as e:
-            log_error("CryptoBot network error", e)
-            raise
-        except Exception as e:
-            log_error("CryptoBot request error", e)
-            raise
+            except aiohttp.ClientError as e:
+                last_err = e
+                log_error("CryptoBot network error", e)
+            except Exception as e:
+                last_err = e
+                log_error("CryptoBot request error", e)
+            await asyncio.sleep(0.5 * (2 ** attempt))
+        if last_err:
+            raise last_err
+        raise Exception("CryptoBot request error")
     
     async def create_invoice(self, amount: float, asset: str = "USDT",
                             description: str = "", expires_in: int = 900) -> dict:
@@ -8388,6 +8547,7 @@ async def main():
         BOT_USERNAME = BOT_USERNAMES[0] or BOT_USERNAME
     dp = Dispatcher()
     dp.update.middleware(BotContextMiddleware())
+    dp.update.middleware(RateLimitMiddleware())
     dp.include_router(router)
     server = await start_render_server()
     for idx, b in enumerate(bots):
@@ -8421,6 +8581,10 @@ async def main():
         server.close()
         await server.wait_closed()
         await cryptobot.close()
+        try:
+            db.close_all()
+        except Exception:
+            pass
         for b in bots:
             try:
                 await b.session.close()
