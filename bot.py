@@ -287,6 +287,15 @@ class BotScopedDict:
     def __setitem__(self, key, value):
         self._dict()[key] = value
 
+    def __contains__(self, key):
+        return key in self._dict()
+
+    def __iter__(self):
+        return iter(self._dict())
+
+    def __len__(self):
+        return len(self._dict())
+
     def get(self, key, default=None):
         return self._dict().get(key, default)
 
