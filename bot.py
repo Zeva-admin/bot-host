@@ -44,7 +44,7 @@ except Exception:
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8780781533:AAE79vv1FsRpYeeZi882C8rE2KpuXuw-Qzg, 8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
+TOKEN = "8254655034:AAEzNUxDUBgCYljvIwCCmHnCaeU9zCroA2I, 8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
 GROQ_API_KEY = "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"
 CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
