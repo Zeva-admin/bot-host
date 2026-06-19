@@ -41,19 +41,38 @@ try:
 except Exception:
     Groq = None
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_env_file(path: Path = BASE_DIR / ".env") -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
+
 # =============================================================================
 # КОНФИГУРАЦИЯ
 # =============================================================================
-TOKEN = "8254655034:AAFq5trSW5021dlQsv427Ivd-CzlCTrObAY, 8548607252:AAFFzd__XttKj6GxcFh_IygRQbgTu7-xL68"
-GROQ_API_KEY = "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"
-CRYPTOBOT_TOKEN = "555759:AAzSWk3aRAtKoZ9Aq7egw7mgvY33g4roLGU"
+TOKEN = os.environ.get("BOT_TOKENS", os.environ.get("BOT_TOKEN", "")).strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "").strip()
 AI_MODEL_EASY = "meta-llama/llama-prompt-guard-2-86m"
 AI_MODEL_NORMAL = "llama-3.3-70b-versatile"
 AI_MODEL_HARD = "openai/gpt-oss-120b"
 ADMIN_USER_ID = 7053001262
 ADMIN_USER_IDS = {7053001262, 7719220317}
-STATS_DB_PATH = Path("casino_stats.db")
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres").strip()
+STATS_DB_PATH = BASE_DIR / "casino_stats.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "-1003691561522").strip()
 REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
 NEWS_CHANNEL_URL = os.environ.get("NEWS_CHANNEL_URL", "https://t.me/durak_cart_channel").strip()
@@ -134,6 +153,27 @@ POINTS_WINNER_SHARE = 0.60
 REF_POINTS_RATE = 0.20
 REF_ACTIVATION_MATCHES = 3
 REDEEM_POINTS_PER_USD = 1000
+
+
+def normalize_stake(amount: float) -> Optional[float]:
+    rounded = round(float(amount), 2)
+    for stake in STAKE_AMOUNTS:
+        if abs(float(stake) - rounded) < 0.000001:
+            return float(stake)
+    return None
+
+
+def parse_stake_value(raw: str) -> Optional[float]:
+    try:
+        return normalize_stake(float((raw or "").strip().replace(",", ".")))
+    except Exception:
+        return None
+
+
+def html_escape_text(value: object) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
 def now_ts() -> float:
     return time.time()
 
@@ -1255,7 +1295,8 @@ class Database:
     # Новые методы для ставок
     def create_betting_match(self, match_id: str, lobby_id: str, stake: float,
                             player1: int, player2: int) -> bool:
-        if not match_id or not lobby_id or stake <= 0 or player1 <= 0 or player2 <= 0:
+        stake = normalize_stake(stake) or 0.0
+        if not match_id or not lobby_id or stake <= 0 or player1 <= 0 or player2 <= 0 or player1 == player2:
             return False
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -1281,7 +1322,26 @@ class Database:
             return False
         finally:
             conn.close()
-    
+
+    def mark_match_playing(self, match_id: str) -> bool:
+        if not match_id:
+            return False
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                self._exec(
+                    cursor,
+                    "UPDATE betting_matches SET status = 'playing' WHERE match_id = ? AND status = 'ready_to_start'",
+                    (match_id,),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            log_error("Ошибка перевода матча в статус playing", e)
+            return False
+        finally:
+            conn.close()
+
     def update_match_invoice(self, match_id: str, user_id: int, invoice_id: str) -> bool:
         if not match_id or not invoice_id or user_id <= 0 or len(str(invoice_id)) > 256:
             return False
@@ -1640,7 +1700,28 @@ class Database:
             return False
         finally:
             conn.close()
-    
+
+    def cancel_betting_match(self, match_id: str, reason: str = "cancelled") -> bool:
+        if not match_id:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            status = (reason or "cancelled")[:32]
+            cursor.execute("""
+                UPDATE betting_matches
+                SET status = ?, winner_id = NULL, finished_at = CURRENT_TIMESTAMP
+                WHERE match_id = ? AND status IN ('waiting_payment', 'ready_to_start', 'playing')
+            """, (status, match_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            log_message(f"Ошибка отмены матча: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
     def get_match_by_lobby(self, lobby_id: str) -> Optional[dict]:
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -2740,7 +2821,7 @@ class Card:
         return Card(rank=rank, suit=Suit(suit_s))
     
     def svg_path(self) -> Path:
-        base = Path(".") / self.suit.value
+        base = BASE_DIR / self.suit.value
         base.mkdir(exist_ok=True)
         rank_tokens = []
         if self.rank in ("A", "K", "Q", "J"):
@@ -5011,7 +5092,7 @@ def render_lobby_text(lobby: Lobby) -> str:
         owner = " (хост)" if p.user_id == lobby.owner_id else ""
         ai = " 🤖" if p.is_ai else ""
         pay = " ✅" if (lobby.mode == LobbyMode.betting and p.has_paid) else (" ❌" if lobby.mode == LobbyMode.betting else "")
-        lines.append(f"• {p.name}{ai}{owner} — {col} {COLOR_NAME_RU.get(p.color, 'без цвета')}{pay}")
+        lines.append(f"• {html_escape_text(p.name)}{ai}{owner} — {col} {COLOR_NAME_RU.get(p.color, 'без цвета')}{pay}")
     lines.append("")
     if lobby.status == LobbyStatus.waiting:
         if lobby.mode == LobbyMode.betting:
@@ -5043,7 +5124,7 @@ def render_game_text(lobby: Lobby, gs: GameState, me: Player, engine: GameEngine
             return "—"
         col = COLOR_EMOJI.get(p.color, "⚪")
         ai = " 🤖" if p.is_ai else ""
-        return f"{col} {p.name}{ai}"
+        return f"{col} {html_escape_text(p.name)}{ai}"
 
     lines = []
     lines.append(f"<b>Дурак</b> • Лобби <code>{lobby.lobby_id}</code>")
@@ -5260,6 +5341,11 @@ async def run_ai_loop_until_human_turn(bot: Bot, lobby: Lobby, gs: GameState, ma
 async def send_betting_invoice(bot: Bot, lobby: Lobby, player: Player):
     if not lobby.stake_amount:
         return
+    stake = normalize_stake(lobby.stake_amount)
+    if stake is None:
+        await bot.send_message(player.user_id, "Некорректная ставка. Создайте лобби заново.")
+        return
+    lobby.stake_amount = stake
     if not cryptobot.enabled:
         await bot.send_message(player.user_id, "Ой, что-то пошло не так.")
         return
@@ -5272,9 +5358,9 @@ async def send_betting_invoice(bot: Bot, lobby: Lobby, player: Player):
     if player.user_id in awaiting_payment:
         return
     invoice, _ = await safe_create_invoice(
-        amount=lobby.stake_amount,
+        amount=stake,
         asset="USDT",
-        description=f"Ставка ${lobby.stake_amount}",
+        description=f"Ставка ${stake}",
         expires_in=PAYMENT_TIMEOUT,
         retries=3,
     )
@@ -5283,9 +5369,13 @@ async def send_betting_invoice(bot: Bot, lobby: Lobby, player: Player):
         return
     invoice_id = int(invoice.get("invoice_id", 0))
     invoice_url = invoice.get("bot_invoice_url", "")
+    if invoice_id <= 0 or not invoice_url:
+        log_message(f"Счет ставки без invoice_id/url: {invoice}")
+        await bot.send_message(player.user_id, "Не удалось создать счет. Попробуйте позже.")
+        return
     if lobby.match_id:
         db.update_match_invoice(lobby.match_id, player.user_id, str(invoice_id))
-        db.create_payment_record(lobby.match_id, player.user_id, str(invoice_id), lobby.stake_amount)
+        db.create_payment_record(lobby.match_id, player.user_id, str(invoice_id), stake)
     awaiting_payment[player.user_id] = {
         "invoice_id": invoice_id,
         "lobby_id": lobby.lobby_id,
@@ -5293,12 +5383,12 @@ async def send_betting_invoice(bot: Bot, lobby: Lobby, player: Player):
     }
     await bot.send_message(
         player.user_id,
-        f"💳 <b>Оплата ставки ${lobby.stake_amount}</b>\n\n"
+        f"💳 <b>Оплата ставки ${stake}</b>\n\n"
         f"Для старта матча оплатите счёт.\n\n"
         f"Ссылка: {invoice_url}",
         parse_mode=ParseMode.HTML,
     )
-    asyncio.create_task(check_payment_loop(bot, player.user_id, invoice_id, lobby.stake_amount, lobby.lobby_id))
+    asyncio.create_task(check_payment_loop(bot, player.user_id, invoice_id, stake, lobby.lobby_id))
 
 
 async def check_payment_loop(bot: Bot, user_id: int, invoice_id: int, amount: float, lobby_id: str):
@@ -5405,20 +5495,57 @@ async def prepare_betting_match(bot: Bot, lobby: Lobby):
         return
     if len(lobby.players) < 2:
         return
+    stake = normalize_stake(lobby.stake_amount)
+    if stake is None:
+        log_message(f"Некорректная ставка в лобби {lobby.lobby_id}: {lobby.stake_amount}")
+        return
+    lobby.stake_amount = stake
     match = db.get_match_by_lobby(lobby.lobby_id)
     if match:
         lobby.match_id = match.get("match_id") or lobby.lobby_id
     elif not lobby.match_id:
-        db.create_betting_match(
+        created = db.create_betting_match(
             match_id=lobby.lobby_id,
             lobby_id=lobby.lobby_id,
-            stake=lobby.stake_amount,
+            stake=stake,
             player1=lobby.players[0].user_id,
             player2=lobby.players[1].user_id,
         )
+        if not created:
+            await bot.send_message(lobby.owner_id, "Не удалось создать платный матч. Попробуйте создать лобби заново.")
+            return
         lobby.match_id = lobby.lobby_id
     await send_betting_invoice(bot, lobby, lobby.players[0])
     await send_betting_invoice(bot, lobby, lobby.players[1])
+
+
+async def leave_lobby_safely(bot: Bot, user_id: int) -> Optional[Lobby]:
+    lobby = lobbies.get_lobby_by_player(user_id)
+    if not lobby:
+        return None
+    gs = engine.get_game(lobby.lobby_id)
+    if lobby.mode == LobbyMode.betting:
+        match_id = lobby.match_id or lobby.lobby_id
+        if lobby.status == LobbyStatus.playing and gs and gs.phase != TurnPhase.finished:
+            winner = next((p for p in lobby.players if p.user_id != user_id and not p.is_ai), None)
+            lobby.status = LobbyStatus.finished
+            gs.phase = TurnPhase.finished
+            gs.winners_user_ids = [winner.user_id] if winner else []
+            gs.loser_user_id = user_id
+            gs.end_reason = "Игрок вышел из платного матча."
+            await update_game_ui(bot, lobby, gs)
+        else:
+            for p in list(lobby.players):
+                if p.is_ai:
+                    continue
+                try:
+                    db.refund_payment(match_id, p.user_id)
+                except Exception:
+                    pass
+                awaiting_payment.pop(p.user_id, None)
+            if lobby.match_id:
+                db.cancel_betting_match(match_id, "cancelled")
+    return lobbies.leave(user_id)
 
 
 # ------------------------
@@ -6221,7 +6348,11 @@ async def cb_ai_diff(call: CallbackQuery, bot: Bot):
         )
         return
     diff_s = call.data[len(CB.AI_DIFF):]
-    diff = AIDifficulty(diff_s)
+    try:
+        diff = AIDifficulty(diff_s)
+    except ValueError:
+        await safe_answer(call, "Некорректная сложность.", show_alert=True)
+        return
     model = {
         AIDifficulty.easy: AI_MODEL_EASY,
         AIDifficulty.normal: AI_MODEL_NORMAL,
@@ -6279,9 +6410,8 @@ async def cb_betting_select(call: CallbackQuery, bot: Bot):
         )
         return
     amount_s = call.data[len(CB.BETTING_SELECT):]
-    try:
-        amount = float(amount_s)
-    except ValueError:
+    amount = parse_stake_value(amount_s)
+    if amount is None:
         await safe_edit_text(
             bot,
             call.message.chat.id,
@@ -6302,9 +6432,9 @@ async def cb_betting_select(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.BETTING_CREATE))
 async def cb_betting_create(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    try:
-        amount = float(call.data[len(CB.BETTING_CREATE):])
-    except ValueError:
+    amount = parse_stake_value(call.data[len(CB.BETTING_CREATE):])
+    if amount is None:
+        await safe_answer(call, "Некорректная ставка.", show_alert=True)
         return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
@@ -6335,9 +6465,9 @@ async def cb_betting_create(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.BETTING_FRIEND))
 async def cb_betting_friend(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    try:
-        amount = float(call.data[len(CB.BETTING_FRIEND):])
-    except ValueError:
+    amount = parse_stake_value(call.data[len(CB.BETTING_FRIEND):])
+    if amount is None:
+        await safe_answer(call, "Некорректная ставка.", show_alert=True)
         return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
@@ -6369,9 +6499,9 @@ async def cb_betting_friend(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.BETTING_AUTO))
 async def cb_betting_auto(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    try:
-        amount = float(call.data[len(CB.BETTING_AUTO):])
-    except ValueError:
+    amount = parse_stake_value(call.data[len(CB.BETTING_AUTO):])
+    if amount is None:
+        await safe_answer(call, "Некорректная ставка.", show_alert=True)
         return
     existing = lobbies.get_lobby_by_player(call.from_user.id)
     if existing:
@@ -6439,9 +6569,9 @@ async def cb_betting_auto(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith(CB.BETTING_LIST))
 async def cb_betting_list(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    try:
-        amount = float(call.data[len(CB.BETTING_LIST):])
-    except ValueError:
+    amount = parse_stake_value(call.data[len(CB.BETTING_LIST):])
+    if amount is None:
+        await safe_answer(call, "Некорректная ставка.", show_alert=True)
         return
     now = now_ts()
     lst = [
@@ -7280,6 +7410,8 @@ async def cb_lobby_start(call: CallbackQuery, bot: Bot):
         await safe_answer(call, "Недостаточно игроков.", show_alert=True)
         return
     lobby.status = LobbyStatus.playing
+    if lobby.mode == LobbyMode.betting and lobby.match_id:
+        db.mark_match_playing(lobby.match_id)
     lobbies._touch(lobby)
     gs = engine.start_game(lobby)
     await update_game_ui(bot, lobby, gs)
@@ -7378,7 +7510,7 @@ async def cb_lobby_leave(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.LOBBY_LEAVE_YES)
 async def cb_lobby_leave_yes(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    lobby = lobbies.leave(call.from_user.id)
+    lobby = await leave_lobby_safely(bot, call.from_user.id)
     if lobby:
         await update_lobby_ui(bot, lobby)
     await show_menu(bot, call.message.chat.id, call.from_user, call.message)
@@ -7427,7 +7559,7 @@ async def cb_game_leave(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == CB.GAME_LEAVE_YES)
 async def cb_game_leave_yes(call: CallbackQuery, bot: Bot):
     await safe_answer(call)
-    lobby = lobbies.leave(call.from_user.id)
+    lobby = await leave_lobby_safely(bot, call.from_user.id)
     if lobby:
         gs = engine.get_game(lobby.lobby_id)
         if gs:
@@ -7472,7 +7604,11 @@ async def cb_game_select(call: CallbackQuery, bot: Bot):
     if len(parts) != 3:
         return
     kind, rank, suit_s = parts
-    card = Card(rank=rank, suit=Suit(suit_s))
+    try:
+        card = Card(rank=rank, suit=Suit(suit_s))
+    except ValueError:
+        await safe_answer(call, "Некорректная карта.", show_alert=True)
+        return
     if kind == "a":
         ok, err = engine.toggle_attack_select(lobby, me, card)
         if not ok:
@@ -7554,8 +7690,12 @@ async def cb_game_defend(call: CallbackQuery, bot: Bot):
     if len(parts) != 3:
         return
     pair_idx_s, rank, suit_s = parts
-    pair_idx = int(pair_idx_s)
-    card = Card(rank=rank, suit=Suit(suit_s))
+    try:
+        pair_idx = int(pair_idx_s)
+        card = Card(rank=rank, suit=Suit(suit_s))
+    except ValueError:
+        await safe_answer(call, "Некорректная карта.", show_alert=True)
+        return
     ok, err = engine.defend(lobby, me, pair_idx, card)
     if not ok:
         await safe_answer(call, err, show_alert=True)
@@ -8183,6 +8323,12 @@ async def update_lobby_ui(bot: Bot, lobby: Lobby):
                 p.ui_message_id = msg.message_id
             except Exception:
                 pass
+    if (
+        lobby.mode == LobbyMode.betting
+        and lobby.status == LobbyStatus.waiting
+        and len(lobby.players) == 2
+    ):
+        await prepare_betting_match(bot, lobby)
 
 
 def extract_check_data(check: dict) -> Tuple[str, str]:
@@ -8227,7 +8373,7 @@ async def award_points_for_match(bot: Bot, lobby: Lobby, match_id: str) -> None:
 
     def _name(uid: int) -> str:
         pl = lobby.get_player(uid) if lobby else None
-        return pl.name if pl else str(uid)
+        return html_escape_text(pl.name if pl else str(uid))
 
     if winner_points > 0:
         db.add_points(winner_id, winner_points, "match_win", match_id)
@@ -8401,8 +8547,8 @@ async def update_game_ui(bot: Bot, lobby: Lobby, gs: GameState):
 
 
 async def broadcast_say(bot: Bot, lobby: Lobby, from_player: Player, text: str):
-    prefix = f"\U0001f4ac {from_player.name}: "
-    msg_text = prefix + (text.strip()[:2000])
+    prefix = f"\U0001f4ac {html_escape_text(from_player.name)}: "
+    msg_text = prefix + html_escape_text(text.strip()[:2000])
     for p in lobby.players:
         if p.is_ai:
             continue
