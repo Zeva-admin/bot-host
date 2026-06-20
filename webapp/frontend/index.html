@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Личный кабинет — CARTPLAY</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main class="cab">
+    <header class="cab-header">
+      <div>
+        <div class="eyebrow">Личный кабинет · CARTPLAY</div>
+        <h1 class="cab-title">Профиль игрока</h1>
+      </div>
+      <div class="uid">UID <b data-bind="user_id">...</b><br><span data-bind="first_seen">в игре</span></div>
+    </header>
+
+    <section class="notice" id="notice" hidden></section>
+
+    <section class="tab-page active" data-page="profile">
+      <div class="hero">
+        <div class="hero-left">
+          <div class="bal-label">Текущий баланс</div>
+          <div class="bal-num"><span>$</span><b data-bind="balance">0.00</b></div>
+          <div class="bal-sub">Выиграно <b data-bind="total_won">$0.00</b> · Проиграно <b data-bind="total_lost">$0.00</b> за всё время</div>
+
+          <div class="suits-row" id="recentSuits"></div>
+          <div class="suits-caption">последние матчи на ставках — ♦ победа · ♠ поражение</div>
+        </div>
+
+        <div class="hero-right">
+          <div>
+            <div class="mini-stat"><span>Депозит всего</span><span class="v" data-bind="total_deposited">$0.00</span></div>
+            <div class="mini-stat"><span>Вывод всего</span><span class="v" data-bind="total_withdrawn">$0.00</span></div>
+            <div class="mini-stat"><span>Матчей сыграно</span><span class="v" data-bind="matches_total">0</span></div>
+            <div class="mini-stat"><span>Винрейт</span><span class="v pos" data-bind="winrate">0%</span></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" data-action="open-bot" data-start="topup">Пополнить</button>
+            <button class="btn" data-action="open-bot" data-start="withdraw">Вывести</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <section class="panel">
+          <h2>История матчей <span class="tag">betting_matches</span></h2>
+          <div id="matchPreview" class="list"></div>
+          <div class="btn-row">
+            <button class="btn stretch" data-nav="history">Вся история →</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Бонусные очки <span class="tag">user_points</span></h2>
+          <div class="points-num" data-bind="points_balance">0</div>
+          <div class="points-cap"><span data-bind="points_total">получено 0 всего</span></div>
+          <div class="rate-line" data-bind="points_rate">Курс: 1000 очков = 1 USDT</div>
+          <div class="btn-row">
+            <button class="btn stretch" data-nav="points">Обменять очки</button>
+          </div>
+
+          <hr class="hr">
+
+          <h2 class="compact">Рефералы <span class="tag">referrals</span></h2>
+          <div class="ref-stats">
+            <div><div class="ref-stat-num" data-bind="ref_total">0</div><div class="ref-stat-cap">всего</div></div>
+            <div><div class="ref-stat-num gold" data-bind="ref_active">0</div><div class="ref-stat-cap">активных</div></div>
+            <div><div class="ref-stat-num" data-bind="ref_points">0</div><div class="ref-stat-cap">очков</div></div>
+          </div>
+          <div class="ref-link" data-bind="ref_link">...</div>
+        </section>
+      </div>
+    </section>
+
+    <section class="tab-page" data-page="history">
+      <div class="section-head">
+        <h2>История</h2>
+        <select id="historyFilter" class="select">
+          <option value="all">Все</option>
+          <option value="win">Победы</option>
+          <option value="lose">Поражения</option>
+        </select>
+      </div>
+      <div class="panel full">
+        <div id="historyList" class="list"></div>
+        <div class="btn-row">
+          <button class="btn stretch" id="loadMoreMatches">Показать ещё</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-page" data-page="points">
+      <div class="panel full">
+        <h2>Очки <span class="tag">points_ledger</span></h2>
+        <div class="points-hero">
+          <div>
+            <div class="points-num" data-bind="points_balance">0</div>
+            <div class="points-cap" data-bind="points_rate">Курс: 1000 очков = 1 USDT</div>
+          </div>
+          <button class="btn primary" id="openRedeem">Обменять</button>
+        </div>
+        <div id="pointsLedger" class="list"></div>
+      </div>
+    </section>
+
+    <section class="tab-page" data-page="referrals">
+      <div class="panel full">
+        <h2>Рефералы <span class="tag">referrals</span></h2>
+        <div class="ref-stats wide">
+          <div><div class="ref-stat-num" data-bind="ref_total">0</div><div class="ref-stat-cap">всего</div></div>
+          <div><div class="ref-stat-num gold" data-bind="ref_active">0</div><div class="ref-stat-cap">активных</div></div>
+          <div><div class="ref-stat-num" data-bind="ref_points">0</div><div class="ref-stat-cap">очков</div></div>
+        </div>
+        <div class="copy-row">
+          <div class="ref-link" data-bind="ref_link">...</div>
+          <button class="btn" id="copyRef">Копировать</button>
+        </div>
+        <div id="referralList" class="list"></div>
+      </div>
+    </section>
+
+    <section class="tab-page" data-page="support">
+      <div class="panel full">
+        <div class="section-head inline">
+          <h2>Поддержка <span class="tag">support_tickets</span></h2>
+          <button class="btn primary" id="newTicket">Новое обращение</button>
+        </div>
+        <form id="ticketForm" class="ticket-form" hidden>
+          <select class="select" name="category">
+            <option>Не пришла выплата</option>
+            <option>Ошибка в игре</option>
+            <option>Проблема с оплатой</option>
+            <option>Другое</option>
+          </select>
+          <textarea name="text" rows="4" placeholder="Опиши ситуацию"></textarea>
+          <div class="btn-row">
+            <button class="btn primary" type="submit">Отправить</button>
+            <button class="btn" type="button" id="cancelTicket">Отмена</button>
+          </div>
+        </form>
+        <div id="ticketList" class="list"></div>
+        <div id="ticketThread" class="thread" hidden></div>
+      </div>
+    </section>
+
+    <nav class="nav-strip">
+      <button class="nav-item active" data-nav="profile">Профиль</button>
+      <button class="nav-item" data-nav="history">История</button>
+      <button class="nav-item" data-nav="points">Очки</button>
+      <button class="nav-item" data-nav="referrals">Рефералы</button>
+      <button class="nav-item" data-nav="support">Поддержка</button>
+    </nav>
+  </main>
+
+  <dialog id="redeemDialog">
+    <form method="dialog" class="modal">
+      <h2>Обмен очков</h2>
+      <input id="redeemAmount" type="number" min="1" step="1" placeholder="Количество очков">
+      <div class="btn-row">
+        <button class="btn primary" id="submitRedeem" type="button">Обменять</button>
+        <button class="btn">Закрыть</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
